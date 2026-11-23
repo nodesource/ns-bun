@@ -1,7 +1,8 @@
 import * as grpc from "@grpc/grpc-js";
 import * as protoLoader from "@grpc/proto-loader";
 import { describe, expect, test } from "bun:test";
-import { bunEnv, bunExe, tempDir } from "harness";
+import { bunEnv, bunExe, tempDir, tls } from "harness";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -103,6 +104,72 @@ async function grpcGateway(commands: object[]) {
       server.forceShutdown();
     },
   };
+}
+
+// The gateway serves harness's self-signed localhost certificate, which the
+// agent trusts as its CA. Client certificates are Node's fixtures: agent1 is
+// signed by ca1 and agent3 by ca2.
+const nodeKeys = join(import.meta.dir, "..", "..", "node", "test", "fixtures", "keys");
+const nodeKey = (name: string) => readFileSync(join(nodeKeys, name), "utf8");
+
+interface CommandStream {
+  headers: http2.IncomingHttpHeaders;
+  stream: http2.ServerHttp2Stream;
+  at: number;
+  // The CN of the client certificate the agent presented.
+  peer: string | undefined;
+}
+
+// A gateway, over TLS when given `secure` options, that records every
+// Command stream and lets `answer` respond to it.
+async function recordingGateway(
+  answer: (command: CommandStream, index: number) => void,
+  secure?: http2.SecureServerOptions,
+) {
+  const server = secure ? http2.createSecureServer(secure) : http2.createServer();
+  const seen: CommandStream[] = [];
+  let changed = () => {};
+  server.on("session", session => session.on("error", () => {}));
+  server.on("stream", (stream, headers) => {
+    stream.on("error", () => {});
+    const peer = secure ? (stream.session?.socket as any)?.getPeerCertificate?.()?.subject?.CN : undefined;
+    const command = { headers, stream, at: performance.now(), peer };
+    seen.push(command);
+    answer(command, seen.length - 1);
+    changed();
+  });
+  await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+  return {
+    port: (server.address() as AddressInfo).port,
+    seen,
+    async until(condition: (seen: CommandStream[]) => boolean) {
+      while (!condition(seen)) await new Promise<void>(resolve => (changed = resolve));
+    },
+    [Symbol.asyncDispose]: async () => {
+      server.close();
+    },
+  };
+}
+
+const keepOpen = ({ stream }: CommandStream) => stream.respond({ ":status": 200, "content-type": "application/grpc" });
+
+// Ends a Command stream at once with a gRPC status (a trailers-only response).
+const endWith =
+  (grpcStatus: number, extra: http2.OutgoingHttpHeaders = {}) =>
+  ({ stream }: CommandStream) =>
+    stream.respond(
+      { ":status": 200, "content-type": "application/grpc", "grpc-status": String(grpcStatus), ...extra },
+      { endStream: true },
+    );
+
+async function readUntil(stream: ReadableStream<Uint8Array>, done: (text: string) => boolean) {
+  const decoder = new TextDecoder();
+  let text = "";
+  for await (const chunk of stream) {
+    text += decoder.decode(chunk, { stream: true });
+    if (done(text)) break;
+  }
+  return text;
 }
 
 function frame(payload: number[]) {
@@ -214,7 +281,7 @@ describe("N|Solid agent", () => {
         args: {
           reconfigure: {
             interval: 3000,
-            tags: ["x"],
+            tags: ["xy"],
             redactSnapshots: true,
             ebpfProfiling: 1,
             sourceCodeEnabled: true,
@@ -246,7 +313,7 @@ describe("N|Solid agent", () => {
         NSOLID_GRPC: `127.0.0.1:${gateway.port}`,
         NSOLID_GRPC_INSECURE: "1",
         NSOLID_APP: "shop",
-        NSOLID_TAGS: "b, a",
+        NSOLID_TAGS: "bb, aa",
         NSOLID_HOSTNAME: "host-1",
         NODE_ENV: "staging",
       },
@@ -272,7 +339,7 @@ describe("N|Solid agent", () => {
       nodeEnv: "staging",
       pid: proc.pid,
       platform: process.platform,
-      tags: ["a", "b"],
+      tags: ["aa", "bb"],
     });
     expect(idFromModule).toMatch(/^[0-9a-f]{40}$/);
     expect((await gateway.commandMetadata).get("nsolid-agent-id")).toEqual([idFromModule]);
@@ -308,7 +375,8 @@ describe("N|Solid agent", () => {
       promiseTracking: false,
       redactSnapshots: true,
       sourceCodeEnabled: true,
-      tags: ["x"],
+      statsdBucket: "nsolid.${env}.${app}.${hostname}.${shortId}",
+      tags: ["xy"],
       traceSampleRate: 1,
       tracingEnabled: false,
       tracingModulesBlacklist: 0,
@@ -328,6 +396,250 @@ describe("N|Solid agent", () => {
       ["r-source", notAvailable],
     ]);
     expect(gateway.acks()).toBe(7);
+  });
+
+  test.concurrent("reads its configuration with N|Solid's precedence and validation", async () => {
+    await using gateway = await grpcGateway([
+      { requestId: "r-info", id: "x", command: "info" },
+      { requestId: "r-initial", id: "x", command: "reconfigure" },
+      {
+        requestId: "r-invalid",
+        id: "x",
+        command: "reconfigure",
+        args: { reconfigure: { interval: 0, traceSampleRate: 5, tags: ["  zz", "yy "] } },
+      },
+    ]);
+    // A tag is cut at 140 bytes without splitting a character: 1 + 69 * 2.
+    const longTag = "a" + Buffer.alloc(140, "é").toString();
+    const manyTags = Array.from({ length: 22 }, (_, i) => `t${String(i).padStart(2, "0")}`);
+    using dir = tempDir("nsolid-config", {
+      "package.json": JSON.stringify({
+        name: "from-package-json",
+        nsolid: {
+          interval: 2500,
+          traceSampleRate: 0.25,
+          redactSnapshots: true,
+          hostname: "pkg-host",
+          assetsEnabled: 0,
+        },
+      }),
+      "app.js": UNTIL_STDIN_CLOSES,
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), join(String(dir), "app.js")],
+      cwd: String(dir),
+      stdin: "pipe",
+      stdout: "ignore",
+      stderr: "pipe",
+      env: {
+        ...bunEnv,
+        NSOLID_GRPC: `127.0.0.1:${gateway.port}`,
+        NSOLID_GRPC_INSECURE: "1",
+        NSOLID_APPNAME: "first",
+        NSOLID_APP: "second",
+        NSOLID_INTERVAL: "-5",
+        NSOLID_TRACE_SAMPLE_RATE: "2",
+        NSOLID_REDACT_SNAPSHOTS: "false",
+        NSOLID_TRACING_MODULES_BLACKLIST: "dns, http, nope",
+        NSOLID_STATSD: "8125",
+        NSOLID_TAGS: [...manyTags, "x", longTag].join(","),
+      },
+    });
+
+    const info = await gateway.next("ExportInfo");
+    expect({ app: info.body.app, hostname: info.body.hostname, tags: info.body.tags }).toEqual({
+      app: "first",
+      hostname: "pkg-host",
+      tags: [longTag.slice(0, 70), ...manyTags.slice(0, 19)],
+    });
+    expect(Buffer.byteLength(info.body.tags[0])).toBe(139);
+
+    const initial = await gateway.next("ExportReconfigure");
+    expect(initial.body).toEqual({
+      assetsEnabled: false,
+      blockedLoopThreshold: "200",
+      contCpuProfile: false,
+      ebpfProfiling: 2,
+      interval: "2500",
+      pauseMetrics: false,
+      promiseTracking: false,
+      redactSnapshots: true,
+      sourceCodeEnabled: false,
+      statsd: "localhost:8125",
+      statsdBucket: "nsolid.${env}.${app}.${hostname}.${shortId}",
+      tags: info.body.tags,
+      traceSampleRate: 0.25,
+      tracingEnabled: false,
+      tracingModulesBlacklist: 13,
+    });
+
+    const invalid = await gateway.next("ExportReconfigure");
+    expect({
+      interval: invalid.body.interval,
+      traceSampleRate: invalid.body.traceSampleRate,
+      tags: invalid.body.tags,
+    }).toEqual({ interval: "2500", traceSampleRate: 0.25, tags: ["yy", "zz"] });
+
+    proc.stdin.end();
+    const stderr = await proc.stderr.text();
+    expect(stderr).toContain(`Tags must be between 2 to 140 bytes. The following are violations:\n  ${longTag}\n  x\n`);
+    expect(stderr).toContain("A maximum of 20 tags are allowed but 23 were provided. Only using the first 20 tags\n");
+  });
+
+  test.concurrent(
+    "connects over TLS to a gateway the CA in NSOLID_GRPC_CERTS signed, and writes NSOLID_GRPC_KEYLOG",
+    async () => {
+      await using gateway = await recordingGateway(keepOpen, tls);
+      using dir = tempDir("nsolid-keylog", { "ca.pem": tls.cert });
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "-e", UNTIL_STDIN_CLOSES],
+        cwd: String(dir),
+        stdin: "pipe",
+        stdout: "ignore",
+        stderr: "inherit",
+        env: {
+          ...bunEnv,
+          NSOLID_GRPC: `localhost:${gateway.port}`,
+          NSOLID_GRPC_CERTS: "ca.pem",
+          NSOLID_GRPC_KEYLOG: "1",
+        },
+      });
+
+      await gateway.until(seen => seen.length > 0);
+      expect(gateway.seen[0].headers[":path"]).toBe(COMMAND_PATH);
+      const keylog = join(String(dir), `nsolid-tls-keylog-${proc.pid}.log`);
+      while (!existsSync(keylog) || !readFileSync(keylog, "utf8").includes("CLIENT_TRAFFIC_SECRET_0")) {
+        await Bun.sleep(10);
+      }
+      expect(readFileSync(keylog, "utf8")).toMatch(/^CLIENT_HANDSHAKE_TRAFFIC_SECRET [0-9a-f]{64} [0-9a-f]+$/m);
+    },
+  );
+
+  test.concurrent("presents NSOLID_GRPC_CLIENT_CERT, and a renewed one from the next connection on", async () => {
+    using dir = tempDir("nsolid-mtls", {
+      "ca.pem": tls.cert,
+      "cert.pem": nodeKey("agent1-cert.pem"),
+      "key.pem": nodeKey("agent1-key.pem"),
+    });
+    let renewed = false;
+    await using gateway = await recordingGateway(
+      // Once the files are renewed, connections with the old certificate are ended.
+      command => (renewed && command.peer !== "agent3" ? endWith(14)(command) : keepOpen(command)),
+      { ...tls, ca: [nodeKey("ca1-cert.pem"), nodeKey("ca2-cert.pem")], requestCert: true, rejectUnauthorized: true },
+    );
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", UNTIL_STDIN_CLOSES],
+      cwd: String(dir),
+      stdin: "pipe",
+      stdout: "ignore",
+      stderr: "inherit",
+      env: {
+        ...bunEnv,
+        NSOLID_GRPC: `localhost:${gateway.port}`,
+        NSOLID_GRPC_CERTS: "ca.pem",
+        NSOLID_GRPC_CLIENT_CERT: "cert.pem",
+        NSOLID_GRPC_CLIENT_KEY: "key.pem",
+        NSOLID_GRPC_CLIENT_CERT_REFRESH_INTERVAL: "1",
+        BUN_NSOLID_RETRY_MS_FOR_TESTING: "20",
+      },
+    });
+
+    await gateway.until(seen => seen.length > 0);
+    expect(gateway.seen[0].peer).toBe("agent1");
+
+    writeFileSync(join(String(dir), "cert.pem"), nodeKey("agent3-cert.pem"));
+    writeFileSync(join(String(dir), "key.pem"), nodeKey("agent3-key.pem"));
+    renewed = true;
+    gateway.seen[0].stream.session?.destroy();
+    await gateway.until(seen => seen.some(command => command.peer === "agent3"));
+  });
+
+  for (const [name, files, env, message] of [
+    [
+      "a client certificate without a key",
+      { "cert.pem": "" },
+      { NSOLID_GRPC_CLIENT_CERT: "cert.pem" },
+      "N|Solid warning: NSOLID_GRPC_CLIENT_CERT is set without NSOLID_GRPC_CLIENT_KEY, so the agent connects without a client certificate\n",
+    ],
+    [
+      "a client key without a certificate",
+      { "key.pem": "" },
+      { NSOLID_GRPC_CLIENT_KEY: "key.pem" },
+      "N|Solid warning: NSOLID_GRPC_CLIENT_KEY is set without NSOLID_GRPC_CLIENT_CERT, so the agent connects without a client certificate\n",
+    ],
+    [
+      "a client certificate that doesn't parse",
+      { "cert.pem": "not a certificate", "key.pem": "not a key" },
+      { NSOLID_GRPC_CLIENT_CERT: "cert.pem", NSOLID_GRPC_CLIENT_KEY: "key.pem" },
+      "N|Solid warning: the client certificate (cert.pem) or its key (key.pem) cannot be used yet: ",
+    ],
+  ] as const) {
+    test.concurrent(`warns about ${name}`, async () => {
+      await using gateway = await recordingGateway(keepOpen, tls);
+      using dir = tempDir("nsolid-client-cert", { "ca.pem": tls.cert, ...files });
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "-e", UNTIL_STDIN_CLOSES],
+        cwd: String(dir),
+        stdin: "pipe",
+        stdout: "ignore",
+        stderr: "pipe",
+        env: {
+          ...bunEnv,
+          NSOLID_GRPC: `localhost:${gateway.port}`,
+          NSOLID_GRPC_CERTS: "ca.pem",
+          ...env,
+        },
+      });
+
+      const stderr = await readUntil(proc.stderr, text => text.includes(message));
+      expect(stderr).toContain(message);
+    });
+  }
+
+  test.concurrent("stops after 20 UNAUTHENTICATED answers, with N|Solid's warning", async () => {
+    await using gateway = await recordingGateway(endWith(16));
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", UNTIL_STDIN_CLOSES],
+      stdin: "pipe",
+      stdout: "ignore",
+      stderr: "pipe",
+      env: {
+        ...bunEnv,
+        NSOLID_GRPC: `127.0.0.1:${gateway.port}`,
+        NSOLID_GRPC_INSECURE: "1",
+        BUN_NSOLID_RETRY_MS_FOR_TESTING: "5",
+      },
+    });
+
+    const stderr = await readUntil(proc.stderr, text => text.includes("Unable to authenticate"));
+    const agentId = gateway.seen[0].headers["nsolid-agent-id"];
+    expect(stderr).toContain(
+      `N|Solid warning: ${agentId} Unable to authenticate, please verify your token and network connection!\n`,
+    );
+    proc.stdin.end();
+    expect(await proc.exited).toBe(0);
+    expect(gateway.seen.length).toBe(20);
+  });
+
+  test.concurrent("waits as long as the gateway's retry-after asks before connecting again", async () => {
+    await using gateway = await recordingGateway((command, index) =>
+      index === 0 ? endWith(8, { "retry-after": "1" })(command) : keepOpen(command),
+    );
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "-e", UNTIL_STDIN_CLOSES],
+      stdin: "pipe",
+      stdout: "ignore",
+      stderr: "inherit",
+      env: {
+        ...bunEnv,
+        NSOLID_GRPC: `127.0.0.1:${gateway.port}`,
+        NSOLID_GRPC_INSECURE: "1",
+        BUN_NSOLID_RETRY_MS_FOR_TESTING: "5",
+      },
+    });
+
+    await gateway.until(seen => seen.length >= 2);
+    expect(gateway.seen[1].at - gateway.seen[0].at).toBeGreaterThanOrEqual(950);
   });
 
   test.concurrent("nsolid and bun:nsolid are the same module, with the process's id", async () => {
