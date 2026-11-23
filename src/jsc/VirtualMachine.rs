@@ -3292,6 +3292,7 @@ impl VirtualMachine {
 
         let hooks = runtime_hooks();
         let _ = self.ensure_debugger(true);
+        crate::nsolid_agent::ensure_started(self);
 
         // Node.js `--trace-*` and `--stack-trace-limit` flags need
         // `internal/process/pre_execution` to run before any user code.
@@ -5355,6 +5356,7 @@ impl VirtualMachine {
         self.event_loop().ensure_waker();
 
         let _ = self.ensure_debugger(true);
+        crate::nsolid_agent::ensure_started(self);
 
         if !self.transpiler.get().options.disable_transpilation {
             if let Some(hooks) = runtime_hooks() {

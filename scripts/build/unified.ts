@@ -66,6 +66,8 @@ const noUnify: readonly string[] = [
   "src/jsc/bindings/webcore/HTTPParsers.cpp",
   "src/jsc/bindings/webcore/JSWasmStreamingCompiler.cpp",
 
+  // The N|Solid agent bridge: standalone, so that it moves no other file into another bundle.
+  "src/jsc/bindings/NSolidAgent.cpp",
   // The ahead-of-time compiler's files: standalone, so that they move no other file into another bundle.
   "src/jsc/bindings/BunAOTCompile.cpp",
   "src/jsc/bindings/BunAOTRuntime.cpp",

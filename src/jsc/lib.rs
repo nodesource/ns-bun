@@ -1170,6 +1170,7 @@ pub mod jsc_abi;
 #[path = "Debugger.rs"]
 pub mod debugger;
 pub use self::debugger as Debugger;
+pub mod nsolid_agent;
 #[path = "SavedSourceMap.rs"]
 pub mod saved_source_map;
 pub use self::saved_source_map as SavedSourceMap;

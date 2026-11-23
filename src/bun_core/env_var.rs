@@ -196,6 +196,9 @@ new!(pub JENKINS_URL: string, "JENKINS_URL", {});
 // `MIMALLOC_VERBOSE`, documented here: https://microsoft.github.io/mimalloc/environment.html
 new!(pub MI_VERBOSE: boolean, "MI_VERBOSE", { default: false });
 new!(pub NO_COLOR: boolean, "NO_COLOR", { default: false });
+// Either one starts the N|Solid agent thread (`bun_jsc::nsolid_agent`).
+new!(pub NSOLID_GRPC: string, "NSOLID_GRPC", {});
+new!(pub NSOLID_SAAS: string, "NSOLID_SAAS", {});
 new!(pub NODE_CHANNEL_FD: string, "NODE_CHANNEL_FD", {});
 new!(pub NODE_CHANNEL_SERIALIZATION_MODE: string, "NODE_CHANNEL_SERIALIZATION_MODE", {});
 // A string, not a boolean: node suppresses warnings only when the value is
