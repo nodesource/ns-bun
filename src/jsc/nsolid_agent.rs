@@ -8,7 +8,6 @@
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
 
 use bun_core::{String as BunString, StringView, env_var};
 
@@ -18,26 +17,28 @@ use crate::{self as jsc, JSGlobalObject};
 bun_core::declare_scope!(nsolid_agent, hidden);
 
 static STARTED: AtomicBool = AtomicBool::new(false);
-static AGENT_ID: OnceLock<[u8; 40]> = OnceLock::new();
 
 unsafe extern "C" {
-    safe fn Bun__NSolid__startAgent(global: &JSGlobalObject, agent_id: &BunString);
+    safe fn Bun__NSolid__startAgent(
+        global: &JSGlobalObject,
+        main_path: &BunString,
+        main_entry_ns: f64,
+        agent_thread_ns: f64,
+        agent_vm_ns: f64,
+    );
 }
 
-/// The id the Console knows this process by: 20 random bytes as 40 lowercase
-/// hex digits, the same shape N|Solid uses. One per process.
-pub fn agent_id() -> &'static [u8; 40] {
-    AGENT_ID.get_or_init(|| {
-        let mut raw = [0u8; 20];
-        bun_boringssl::rand_bytes(&mut raw);
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut id = [0u8; 40];
-        for (i, byte) in raw.iter().enumerate() {
-            id[i * 2] = HEX[(byte >> 4) as usize];
-            id[i * 2 + 1] = HEX[(byte & 0x0f) as usize];
-        }
-        id
-    })
+/// The startup marks the agent reports, in nanoseconds since the process
+/// started, all on the clock `bun_core::start_time()` was read from.
+#[derive(Clone, Copy)]
+struct StartupMarks {
+    main_entry: f64,
+    agent_thread: f64,
+    agent_vm: f64,
+}
+
+fn since_process_start_ns() -> f64 {
+    (bun_core::time::nano_timestamp() - bun_core::start_time()).max(0) as f64
 }
 
 fn is_requested() -> bool {
@@ -54,25 +55,27 @@ pub fn ensure_started(vm: &VirtualMachine) {
     if STARTED.swap(true, Ordering::Relaxed) {
         return;
     }
+    let main_entry = since_process_start_ns();
+    let main_path = vm.main().unwrap_or_default().to_vec();
     // The agent VM builds its `process.env` from this copy, which is where it
     // reads the rest of its configuration.
     let env_map = match vm.env_loader().map.clone_with_allocator() {
         Ok(map) => map,
         Err(_) => return,
     };
-    let id = agent_id();
     // A full `VirtualMachine::init` plus module load needs more than the
     // 2 MiB default stack, as for the Debugger thread.
     let spawned = std::thread::Builder::new()
         .name("NSolidAgent".to_string())
         .stack_size(16 * 1024 * 1024)
-        .spawn(move || agent_thread(env_map, id));
+        .spawn(move || agent_thread(env_map, main_path, main_entry));
     if spawned.is_err() {
         bun_core::scoped_log!(nsolid_agent, "could not spawn the agent thread");
     }
 }
 
-fn agent_thread(env_map: bun_dotenv::Map, id: &'static [u8; 40]) {
+fn agent_thread(env_map: bun_dotenv::Map, main_path: Vec<u8>, main_entry: f64) {
+    let agent_thread = since_process_start_ns();
     bun_core::asan::disable_leak_checks_on_current_thread();
     bun_core::Output::Source::configure_named_thread(bun_core::zstr!("NSolidAgent"));
     jsc::mark_binding();
@@ -93,25 +96,39 @@ fn agent_thread(env_map: bun_dotenv::Map, id: &'static [u8; 40]) {
     extern "C" fn start_trampoline(ctx: *mut c_void) {
         // SAFETY: `ctx` is `&mut slot` below; `hold_api_lock` calls this
         // synchronously on the same frame.
-        let id = unsafe { (*ctx.cast::<Option<&'static [u8; 40]>>()).take() };
-        run(id.expect("agent id"));
+        let init = unsafe { (*ctx.cast::<Option<(Vec<u8>, StartupMarks)>>()).take() };
+        let (main_path, marks) = init.expect("agent init");
+        run(&main_path, marks);
     }
-    let mut slot = Some(id);
+    let mut slot = Some((
+        main_path,
+        StartupMarks {
+            main_entry,
+            agent_thread,
+            agent_vm: since_process_start_ns(),
+        },
+    ));
     #[allow(deprecated)]
     vm.global()
         .vm()
         .hold_api_lock((&raw mut slot).cast(), start_trampoline);
 }
 
-/// Runs inside `holdAPILock` on the agent thread: hands the agent id to the
-/// JS agent, then spins this thread's event loop forever.
-fn run(id: &'static [u8; 40]) -> ! {
+/// Runs inside `holdAPILock` on the agent thread: starts the JS agent with
+/// the main thread's entry point, then spins this thread's event loop forever.
+fn run(main_path: &[u8], marks: StartupMarks) -> ! {
     jsc::mark_binding();
     let this: &VirtualMachine = VirtualMachine::get();
     {
-        let id = StringView::borrow_utf8(id);
+        let main_path = StringView::borrow_utf8(main_path);
         let _scope = this.enter_event_loop_scope();
-        Bun__NSolid__startAgent(this.global(), &id);
+        Bun__NSolid__startAgent(
+            this.global(),
+            &main_path,
+            marks.main_entry,
+            marks.agent_thread,
+            marks.agent_vm,
+        );
     }
     let _ = this.global().handle_rejected_promises();
     this.event_loop().tick();

@@ -4,24 +4,48 @@
 //
 // The Console drives the agent through the bidirectional `Command` stream: it
 // sends a `CommandRequest` and expects an empty `CommandResponse` back at once,
-// which it also uses to tell a live agent from a dead one. Replies to the
-// commands themselves are separate unary RPCs.
+// which it also uses to tell a live agent from a dead one. Each command is
+// then answered with the unary or client-streaming RPC that carries its
+// result, echoing the request's id.
 
 const http2 = require("node:http2");
+const os = require("node:os");
+const protobuf = require("internal/nsolid/protobuf");
+const nsolidConfig = require("internal/nsolid/config");
 
-const COMMAND_PATH = "/grpcagent.NSolidService/Command";
+const SERVICE = "grpcagent.NSolidService";
 const SAAS_KEY_LENGTH = 40;
 const SAAS_CONSOLE_ID_LENGTH = 36;
 const RETRY_MIN_MS = 1_000;
 const RETRY_MAX_MS = 30_000;
-const GRPC_HEADER_LENGTH = 5;
-// An empty protobuf message, framed: not compressed, length 0.
-const EMPTY_MESSAGE = new Uint8Array(GRPC_HEADER_LENGTH);
+const EMPTY_FRAME = protobuf.frame(new Uint8Array(0));
+// N|Solid's ENotAvailable: what the agent answers for what it can't provide.
+const NOT_AVAILABLE = { code: 404, message: "Resource not available" };
+
+// The RPC that carries each command's answer.
+const replyRpc: Record<string, string> = {
+  info: "ExportInfo",
+  metrics: "ExportMetrics",
+  packages: "ExportPackages",
+  reconfigure: "ExportReconfigure",
+  startup_times: "ExportStartupTimes",
+  source_code: "ExportSourceCode",
+  profile: "ExportAsset",
+  heap_profile: "ExportAsset",
+  heap_sampling: "ExportAsset",
+  snapshot: "ExportAsset",
+};
 
 interface Endpoint {
   authority: string;
   secure: boolean;
   saasToken: string | undefined;
+}
+
+interface StartupMarks {
+  mainEntryNs: number;
+  agentThreadNs: number;
+  agentVmNs: number;
 }
 
 function isTrue(value: string | undefined): boolean {
@@ -64,64 +88,180 @@ function resolveEndpoint(env: Record<string, string | undefined>): Endpoint | un
   }
 }
 
-// Answers each complete gRPC message on the Command stream with an empty one.
-// Decoding the `CommandRequest`s comes with the protobuf codec.
-function ackCommands(stream) {
-  let pending = Buffer.alloc(0);
-  stream.on("data", (chunk: Buffer) => {
-    pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-    while (pending.length >= GRPC_HEADER_LENGTH) {
-      const length = pending.readUInt32BE(1);
-      if (pending.length < GRPC_HEADER_LENGTH + length) break;
-      pending = pending.subarray(GRPC_HEADER_LENGTH + length);
-      stream.write(EMPTY_MESSAGE);
-    }
-  });
+function recorded() {
+  const ms = Date.now();
+  return { seconds: Math.floor(ms / 1000), nanoseconds: (ms % 1000) * 1_000_000 };
 }
 
-function connect(endpoint: Endpoint, agentId: string) {
-  const headers: Record<string, string> = {
-    ":method": "POST",
-    ":path": COMMAND_PATH,
-    "content-type": "application/grpc",
-    "te": "trailers",
-    "grpc-accept-encoding": "identity",
-    "nsolid-agent-id": agentId,
-    "nsolid-version": `bun-v${Bun.version}`,
-  };
-  if (endpoint.saasToken) headers["nsolid-saas"] = endpoint.saasToken;
-  const url = `${endpoint.secure ? "https" : "http"}://${endpoint.authority}`;
+class Agent {
+  config;
+  metadata: Record<string, string>;
+  url: string;
+  session: any = null;
+  attempt = 0;
 
-  let attempt = 0;
-  const open = () => {
+  constructor(
+    endpoint: Endpoint,
+    public agentId: string,
+    mainPath: string,
+    public marks: StartupMarks,
+  ) {
+    this.config = nsolidConfig.createConfig(process.env, mainPath);
+    this.url = `${endpoint.secure ? "https" : "http"}://${endpoint.authority}`;
+    this.metadata = {
+      "content-type": "application/grpc",
+      "te": "trailers",
+      "grpc-accept-encoding": "identity",
+      "nsolid-agent-id": agentId,
+      "nsolid-version": `bun-v${Bun.version}`,
+    };
+    if (endpoint.saasToken) this.metadata["nsolid-saas"] = endpoint.saasToken;
+  }
+
+  connect() {
     let retried = false;
     const retry = () => {
       if (retried) return;
       retried = true;
-      const ceiling = Math.min(RETRY_MAX_MS, RETRY_MIN_MS * 2 ** attempt++);
-      setTimeout(open, ceiling / 2 + Math.random() * (ceiling / 2));
+      this.session = null;
+      const ceiling = Math.min(RETRY_MAX_MS, RETRY_MIN_MS * 2 ** this.attempt++);
+      setTimeout(() => this.connect(), ceiling / 2 + Math.random() * (ceiling / 2));
     };
 
-    const session = http2.connect(url);
+    const session = http2.connect(this.url);
+    this.session = session;
     session.on("error", (err: Error) => $debug("session error:", err?.message));
     session.on("close", retry);
 
-    const stream = session.request(headers, { endStream: false });
+    const stream = session.request(
+      { ":method": "POST", ":path": `/${SERVICE}/Command`, ...this.metadata },
+      { endStream: false },
+    );
     stream.on("response", () => {
-      attempt = 0;
+      this.attempt = 0;
     });
     stream.on("error", (err: Error) => $debug("command stream error:", err?.message));
     stream.on("close", () => session.close());
-    ackCommands(stream);
-  };
-  open();
+
+    const frames = new protobuf.FrameReader();
+    stream.on("data", (chunk: Uint8Array) => {
+      for (const message of frames.push(chunk)) {
+        stream.write(EMPTY_FRAME);
+        let request;
+        try {
+          request = protobuf.decode("grpcagent.CommandRequest", message);
+        } catch (err) {
+          $debug("undecodable command:", (err as Error)?.message);
+          continue;
+        }
+        this.handle(request).catch((err: Error) => $debug(`command ${request.command} failed:`, err?.message));
+      }
+    });
+  }
+
+  // Sends one message on a unary or client-streaming RPC of the service, and
+  // waits for the call to end.
+  send(rpc: string, message: object): Promise<void> {
+    const session = this.session;
+    if (!session || session.closed || session.destroyed) return Promise.resolve();
+    const [type] = protobuf.services[SERVICE][rpc];
+    const { promise, resolve } = Promise.withResolvers<void>();
+    let status: string | undefined;
+    const stream = session.request({ ":method": "POST", ":path": `/${SERVICE}/${rpc}`, ...this.metadata });
+    stream.on("response", (headers: Record<string, string>) => {
+      status = headers["grpc-status"] ?? status;
+    });
+    stream.on("trailers", (trailers: Record<string, string>) => {
+      status = trailers["grpc-status"] ?? status;
+    });
+    stream.on("data", () => {});
+    stream.on("error", (err: Error) => $debug(`${rpc} error:`, err?.message));
+    stream.on("close", () => {
+      if (status !== undefined && status !== "0") $debug(`${rpc} answered grpc-status ${status}`);
+      resolve();
+    });
+    stream.end(protobuf.frame(protobuf.encode(type, message)));
+    return promise;
+  }
+
+  common(request, error?: { code: number; message: string }) {
+    return { requestId: request.requestId, command: request.command, recorded: recorded(), error };
+  }
+
+  async handle(request) {
+    const command = request.command;
+    const rpc = replyRpc[command];
+    if (!rpc) {
+      $debug("unknown command:", command);
+      return;
+    }
+    switch (command) {
+      case "info":
+        return this.send(rpc, { common: this.common(request), body: this.info() });
+      case "startup_times":
+        return this.send(rpc, { common: this.common(request), body: this.startupTimes() });
+      case "reconfigure":
+        nsolidConfig.applyReconfigure(this.config, request.args?.reconfigure);
+        return this.send(rpc, { common: this.common(request), body: nsolidConfig.reconfigureBody(this.config) });
+      default: {
+        const message: Record<string, any> = { common: this.common(request, NOT_AVAILABLE) };
+        if (rpc === "ExportAsset") message.thread_id = request.args?.profile?.thread_id ?? 0;
+        return this.send(rpc, message);
+      }
+    }
+  }
+
+  info() {
+    const cpus = os.cpus();
+    // The runtime is Bun: the Console reads versions.node as "this is Node.js",
+    // and Bun's v8 entry is only what it reports for compatibility.
+    const versions: Record<string, string> = {};
+    for (const [name, version] of Object.entries(process.versions)) {
+      if (name !== "node" && name !== "v8" && typeof version === "string") versions[name] = version;
+    }
+    return {
+      app: this.config.app,
+      appVersion: this.config.appVersion,
+      arch: process.arch,
+      cpuCores: cpus.length,
+      cpuModel: cpus[0]?.model ?? "",
+      execPath: process.execPath,
+      hostname: this.config.hostname,
+      id: this.agentId,
+      main: this.config.main,
+      nodeEnv: this.config.nodeEnv,
+      pid: process.pid,
+      platform: process.platform,
+      processStart: Math.round(Date.now() - process.uptime() * 1000),
+      tags: this.config.tags,
+      totalMem: os.totalmem(),
+      versions,
+    };
+  }
+
+  // Nanoseconds since the process started; the Console measures each mark
+  // from `timeOrigin`.
+  startupTimes() {
+    return {
+      timeOrigin: 0,
+      main_module_start: Math.round(this.marks.mainEntryNs),
+      nsolid_agent_thread_start: Math.round(this.marks.agentThreadNs),
+      nsolid_agent_ready: Math.round(this.marks.agentVmNs),
+    };
+  }
 }
 
-export default function start(agentId: string) {
+export default function start(
+  agentId: string,
+  mainPath: string,
+  mainEntryNs: number,
+  agentThreadNs: number,
+  agentVmNs: number,
+) {
   const endpoint = resolveEndpoint(process.env);
   if (!endpoint) {
     $debug("no usable NSOLID_GRPC or NSOLID_SAAS");
     return;
   }
-  connect(endpoint, agentId);
+  new Agent(endpoint, agentId, mainPath, { mainEntryNs, agentThreadNs, agentVmNs }).connect();
 }

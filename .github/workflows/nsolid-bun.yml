@@ -1,0 +1,76 @@
+name: nsolid-bun
+
+# NodeSource's build of Bun with the N|Solid agent: a Linux x64 release build,
+# the N|Solid tests against it, and the stripped binary as an artifact. Bun's
+# own pipeline runs on oven-sh's machines, so this one stands on its own.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "claude/**"
+      - "nsolid/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUN_VERSION: "1.4.4"
+
+jobs:
+  linux-x64:
+    name: Linux x64
+    # GitHub's standard runner (4 cores, 16 GB) builds Bun slowly and is short
+    # of disk; point NSOLID_BUN_LINUX_X64_RUNNER at a larger runner's label.
+    runs-on: ${{ vars.NSOLID_BUN_LINUX_X64_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install the pinned LLVM
+        run: |
+          sudo mkdir -p /opt/llvm && sudo chown "$USER" /opt/llvm
+          bun scripts/nsolid/install-llvm.ts /opt/llvm
+          echo /opt/llvm/bin >> "$GITHUB_PATH"
+
+      - name: Install build tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ninja-build nasm
+
+      - name: Check the agent's protocol tables
+        run: bun packages/nsolid-protocol/generate.ts --check
+
+      - name: Build
+        run: bun run build:release
+
+      - name: Install test dependencies
+        working-directory: test
+        run: bun install --frozen-lockfile
+
+      - name: N|Solid tests
+        run: ./build/release/bun-profile test test/js/bun/nsolid/
+
+      - name: Package
+        run: |
+          mkdir -p dist/nsolid-bun-linux-x64
+          cp build/release/bun dist/nsolid-bun-linux-x64/nsolid-bun
+          cd dist && tar -czf nsolid-bun-linux-x64.tar.gz nsolid-bun-linux-x64
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nsolid-bun-linux-x64
+          path: dist/nsolid-bun-linux-x64.tar.gz
+          if-no-files-found: error

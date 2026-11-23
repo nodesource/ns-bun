@@ -164,6 +164,7 @@ const answersOfNativeFunctions: readonly (readonly [b.BuiltinPath, b.TableType])
   [cpp("JSInspectorProfiler.cpp", "jsFunction_startPreciseCoverage"), b.undefined],
   [cpp("JSInspectorProfiler.cpp", "jsFunction_stopCPUProfiler"), b.string],
   [cpp("JSInspectorProfiler.cpp", "jsFunction_stopPreciseCoverage"), b.undefined],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidAgentId"), b.string],
   [cpp("Worker.cpp", "jsFunctionPostMessage"), b.undefined],
 ];
 

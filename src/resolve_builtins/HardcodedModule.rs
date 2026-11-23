@@ -15,6 +15,8 @@ pub enum HardcodedModule {
     BunFfi,
     #[strum(serialize = "bun:jsc")]
     BunJsc,
+    #[strum(serialize = "bun:nsolid")]
+    BunNsolid,
     #[strum(serialize = "bun:main")]
     BunMain,
     #[strum(serialize = "bun:test")]
@@ -212,6 +214,7 @@ bun_core::comptime_string_map! {
         b"bun:bake" => HardcodedModule::BunBake,
         b"bun:ffi" => HardcodedModule::BunFfi,
         b"bun:jsc" => HardcodedModule::BunJsc,
+        b"bun:nsolid" => HardcodedModule::BunNsolid,
         b"bun:main" => HardcodedModule::BunMain,
         b"bun:test" => HardcodedModule::BunTest,
         b"bun:test/vitest" => HardcodedModule::BunTestVitest,
@@ -716,6 +719,7 @@ const BUN_EXTRA_ALIAS_KVS: &[AliasKv] = &[
     entry!("bun:bake"),
     entry!("bun:ffi"),
     entry!("bun:jsc"),
+    entry!("bun:nsolid"),
     entry!("bun:main"),
     entry!("bun:sqlite"),
     entry!("bun:wrap"),
@@ -740,6 +744,15 @@ const BUN_EXTRA_ALIAS_KVS: &[AliasKv] = &[
         b"ffi",
         Alias {
             path: zstr!("bun:ffi"),
+            tag: import_record::Tag::Builtin,
+            node_builtin: false,
+            node_only_prefix: false,
+        },
+    ),
+    (
+        b"nsolid",
+        Alias {
+            path: zstr!("bun:nsolid"),
             tag: import_record::Tag::Builtin,
             node_builtin: false,
             node_only_prefix: false,
