@@ -531,9 +531,6 @@ mod draft {
     /// This is useful for testing as a crash in here will not 'panicked during a panic'.
     const ENABLE: bool = true;
 
-    /// Overridable with BUN_CRASH_REPORT_URL environment variable.
-    const DEFAULT_REPORT_BASE_URL: &str = "https://bun.report";
-
     /// Only print the `Bun has crashed` message once. Once this is true, control
     /// flow is not returned to the main application.
     static HAS_PRINTED_MESSAGE: AtomicBool = AtomicBool::new(false);
@@ -1094,9 +1091,9 @@ mod draft {
                                 let native_plugin_name =
                                     unsafe { bun_core::ffi::cstr(name) }.to_bytes();
                                 if write!(writer, bun_core::pretty_fmt!(
-                                "Bun has encountered a crash while running the <red><d>\"{s}\"<r> native plugin.\n\nTo send a redacted crash report to Bun's team,\nplease file a GitHub issue using the link below:\n\n",
+                                "Bun has encountered a crash while running the <red><d>\"{s}\"<r> native plugin.\n\n",
                                 true,
-                            ), bstr::BStr::new(native_plugin_name)).is_err() { abort(); }
+                            ), bstr::BStr::new(native_plugin_name)).is_err() || writer.write_all(report_request()).is_err() { abort(); }
                             } else if bun_analytics::features::unsupported_uv_function
                                 .load(Ordering::Relaxed)
                                 > 0
@@ -1114,13 +1111,19 @@ mod draft {
                                     abort();
                                 }
                             } else if matches!(reason, CrashReason::OutOfMemory) {
-                                if writer.write_all(
-                                b"Bun has run out of memory.\n\nTo send a redacted crash report to Bun's team,\nplease file a GitHub issue using the link below:\n\n",
-                            ).is_err() { abort(); }
+                                if writer.write_all(b"Bun has run out of memory.\n\n").is_err()
+                                    || writer.write_all(report_request()).is_err()
+                                {
+                                    abort();
+                                }
                             } else {
-                                if writer.write_all(
-                                b"Bun has crashed. This indicates a bug in Bun, not your code.\n\nTo send a redacted crash report to Bun's team,\nplease file a GitHub issue using the link below:\n\n",
-                            ).is_err() { abort(); }
+                                if writer
+                                    .write_all(b"Bun has crashed. This indicates a bug in Bun, not your code.\n\n")
+                                    .is_err()
+                                    || writer.write_all(report_request()).is_err()
+                                {
+                                    abort();
+                                }
                             }
                         }
 
@@ -1484,7 +1487,9 @@ mod draft {
             if let Some(url) = env_var::BUN_CRASH_REPORT_URL::get() {
                 return strings::without_trailing_slash(url);
             }
-            DEFAULT_REPORT_BASE_URL.as_bytes()
+            // nsolid-bun has no report service of its own: the trace string
+            // is printed bare, to be included in a report to NodeSource.
+            b""
         })
     }
 
@@ -2018,11 +2023,10 @@ mod draft {
                 } else {
                     let _ = writer.write_all(b": ");
                 }
-                let _ = writer.write_all(
-                    b"Bun has crashed. This indicates a bug in Bun, not your code.\n\n\
-                  To send a redacted crash report to Bun's team,\n\
-                  please file a GitHub issue using the link below:\n\n ",
-                );
+                let _ = writer
+                    .write_all(b"Bun has crashed. This indicates a bug in Bun, not your code.\n\n");
+                let _ = writer.write_all(report_request());
+                let _ = writer.write_all(b" ");
                 if enable_ansi_colors_stderr() {
                     let _ = writer.write_all(&Output::pretty_fmt::<true>("<cyan>"));
                 }
@@ -2809,8 +2813,11 @@ mod draft {
     }
 
     fn encode_trace_string(opts: &TraceString<'_>, writer: &mut impl Write) -> crate::Result<()> {
-        writer.write_all(report_base_url())?;
-        writer.write_all(b"/")?;
+        let base_url = report_base_url();
+        if !base_url.is_empty() {
+            writer.write_all(base_url)?;
+            writer.write_all(b"/")?;
+        }
         writer.write_all(Environment::VERSION_STRING.as_bytes())?;
         writer.write_all(b"/")?;
         writer.write_all(&[Platform::CURRENT])?;
@@ -2920,6 +2927,12 @@ mod draft {
             return false;
         }
 
+        // nsolid-bun has no crash report service: it reports only to where
+        // BUN_CRASH_REPORT_URL says.
+        if Global::NSOLID_BUN {
+            return has_report_url();
+        }
+
         // If trying to test the crash handler backend, implicitly enable reporting
         if let Some(value) = env_var::BUN_CRASH_REPORT_URL::get() {
             return !value.is_empty();
@@ -2959,6 +2972,19 @@ mod draft {
         }
 
         false
+    }
+
+    fn has_report_url() -> bool {
+        env_var::BUN_CRASH_REPORT_URL::get().is_some_and(|url| !url.is_empty())
+    }
+
+    /// What a crash message asks of whoever reads it, before the trace string.
+    fn report_request() -> &'static [u8] {
+        if has_report_url() {
+            b"To send a redacted crash report to Bun's team,\nplease file a GitHub issue using the link below:\n\n"
+        } else {
+            b"Please include this crash trace when you report it to NodeSource:\n\n"
+        }
     }
 
     /// Bun automatically reports crashes on Windows and macOS

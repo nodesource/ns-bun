@@ -26,7 +26,7 @@
     "thread spawn": 1
   },
   "src/jsc/nsolid_agent.rs": {
-    "thread spawn": 1
+    "thread spawn": 2
   },
   "src/jsc/thread_isolated.rs": {
     "unsafe impl Send": [

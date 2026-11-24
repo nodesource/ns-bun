@@ -2367,7 +2367,12 @@ pub(crate) fn print_version_and_exit() -> ! {
     // straight to the buffered stdout writer instead. One `write_all` (the
     // `\n` is baked into the constant) → one syscall.
     let w = Output::writer();
-    let _ = w.write_all(Global::package_json_version_nl.as_bytes());
+    let line = if Global::NSOLID_BUN {
+        Global::version_line_nl
+    } else {
+        Global::package_json_version_nl
+    };
+    let _ = w.write_all(line.as_bytes());
     Output::flush();
     Global::exit(0);
 }

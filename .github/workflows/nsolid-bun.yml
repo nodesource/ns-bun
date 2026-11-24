@@ -54,14 +54,23 @@ jobs:
         run: bun packages/nsolid-protocol/generate.ts --check
 
       - name: Build
-        run: bun run build:release
+        env:
+          # Set once nsolid-webkit-mirror.yml has copied the pinned WebKit release.
+          NSOLID_WEBKIT_MIRROR: ${{ vars.NSOLID_WEBKIT_MIRROR }}
+        run: bun run build:release ${NSOLID_WEBKIT_MIRROR:+--webkit-mirror=$NSOLID_WEBKIT_MIRROR}
 
       - name: Install test dependencies
         working-directory: test
         run: bun install --frozen-lockfile
 
       - name: N|Solid tests
-        run: ./build/release/bun-profile test test/js/bun/nsolid/
+        # The runner hands a crashing process to systemd-coredump, which holds
+        # it for seconds while it reads a large binary's memory; the crash
+        # tests' processes end at once, as on Bun's own CI machines.
+        run: |
+          echo core | sudo tee /proc/sys/kernel/core_pattern
+          ulimit -c 0
+          ./build/release/bun-profile test test/js/bun/nsolid/
 
       - name: Package
         run: |

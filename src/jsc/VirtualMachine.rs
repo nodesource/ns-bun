@@ -2000,6 +2000,12 @@ impl VirtualMachine {
             if is_rejection { 1 } else { 0 },
         ) > 0;
         if !handled {
+            if self.is_main_thread() {
+                crate::nsolid_agent::record_fatal_error(
+                    global_object,
+                    err.to_error().unwrap_or(err),
+                );
+            }
             // `beforeExit` has already been dispatched, so the run is winding
             // down and there is no loop turn left to defer to: print the error
             // and exit, like node's fatal-exception path. Main thread only:
@@ -2133,6 +2139,10 @@ impl VirtualMachine {
         self.write_profiles();
 
         ExitHandler::dispatch_on_exit(self);
+
+        if self.is_main_thread() {
+            crate::nsolid_agent::report_exit(i32::from(self.exit_handler.exit_code.get()), None);
+        }
 
         // process.exit() never reaches drain_microtasks; flush AutoFlusher sinks here.
         if !self.is_inside_deferred_task_queue.get() {

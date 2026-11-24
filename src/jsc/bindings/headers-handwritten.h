@@ -475,6 +475,7 @@ extern "C" bool Bun__VM__isTestEntryPoint(void* bunVM, const BunString* key);
 
 // Used in process.version
 extern "C" const char* Bun__version;
+extern "C" const char* Bun__nsolidBunVersion;
 extern "C" const char* Bun__version_with_sha;
 
 extern "C" const char* Bun__version_sha;

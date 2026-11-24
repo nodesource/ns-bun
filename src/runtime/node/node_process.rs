@@ -196,6 +196,12 @@ static Bun__version_with_sha: CStrPtr = CStrPtr(
         .cast::<c_char>(),
 );
 #[unsafe(no_mangle)]
+static Bun__nsolidBunVersion: CStrPtr = CStrPtr(
+    const_format::concatcp!(Global::nsolid_bun_version, "\0")
+        .as_ptr()
+        .cast::<c_char>(),
+);
+#[unsafe(no_mangle)]
 static Bun__version_sha: CStrPtr = CStrPtr(
     const_format::concatcp!(Environment::GIT_SHA, "\0")
         .as_ptr()
