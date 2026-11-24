@@ -81,7 +81,7 @@ function metrics(callback?: (err: null, metrics: object) => void) {
   const memory = process.memoryUsage();
   let user = "";
   try {
-    user = os.userInfo().username;
+    user = String(os.userInfo().username);
   } catch {}
   const result = {
     threadName: "",

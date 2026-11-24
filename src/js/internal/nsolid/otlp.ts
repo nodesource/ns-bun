@@ -111,7 +111,7 @@ function resource(identity: Identity) {
   const { appVersion } = identity;
   if (appVersion) attributes.push(attribute("service.version", appVersion));
   try {
-    attributes.push(attribute("process.owner", os.userInfo().username));
+    attributes.push(attribute("process.owner", String(os.userInfo().username)));
   } catch {}
   return { attributes };
 }

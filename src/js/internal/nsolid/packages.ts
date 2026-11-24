@@ -49,7 +49,7 @@ const readAtOnce: Record<Read["read"], (path: string) => unknown> = {
 const readLater: Record<Read["read"], (path: string) => Promise<unknown>> = {
   directory: path => fs.promises.readdir(path, { withFileTypes: true }),
   isDirectory: async path => (await fs.promises.stat(path)).isDirectory(),
-  json: async path => parseJson(await fs.promises.readFile(path, "utf8")),
+  json: async path => parseJson(String(await fs.promises.readFile(path, "utf8"))),
   realpath: path => fs.promises.realpath(path),
 };
 
