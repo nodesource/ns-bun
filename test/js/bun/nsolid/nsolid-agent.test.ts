@@ -1,7 +1,8 @@
 import * as grpc from "@grpc/grpc-js";
 import * as protoLoader from "@grpc/proto-loader";
+import { dlopen } from "bun:ffi";
 import { describe, expect, test } from "bun:test";
-import { bunEnv, bunExe, isLinux, tempDir, tls } from "harness";
+import { bunEnv, bunExe, isGlibc, tempDir, tls } from "harness";
 import { existsSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
@@ -10,6 +11,11 @@ import { join } from "node:path";
 const COMMAND_PATH = "/grpcagent.NSolidService/Command";
 // Keeps the child alive for the test, and lets it exit if the test runner dies first.
 const UNTIL_STDIN_CLOSES = "for await (const _ of console) {}";
+
+// Sends a signal to one thread of a process.
+const tgkill = isGlibc
+  ? dlopen("libc.so.6", { tgkill: { args: ["i32", "i32", "i32"], returns: "i32" } }).symbols.tgkill
+  : undefined;
 
 // Stands in for the Console's gateway: answers the first Command stream it is
 // offered and hands it to the test, and accepts every other call at once.
@@ -690,35 +696,25 @@ describe("N|Solid agent", () => {
     });
 
     // The signal handler waits on the agent's thread and on the thread that
-    // reports the signal. Handled on either, it held the exit for 5 seconds.
-    test.concurrent.skipIf(!isLinux)("without handling a signal on the agent's own threads", async () => {
-      await using gateway = await grpcGateway([{ requestId: "r-info", id: "x", command: "info" }]);
-      await using proc = Bun.spawn({
-        cmd: [bunExe(), "-e", UNTIL_STDIN_CLOSES],
-        stdin: "pipe",
-        stdout: "ignore",
-        stderr: "ignore",
-        env: { ...bunEnv, NSOLID_GRPC: `127.0.0.1:${gateway.port}`, NSOLID_GRPC_INSECURE: "1" },
+    // reports the signal. A signal the kernel gave either of them went
+    // unreported, and held the exit for 5 seconds.
+    for (const thread of ["NSolidAgent", "NSolidSignal"]) {
+      test.concurrent.skipIf(!isGlibc)(`with a signal the kernel gives the ${thread} thread`, async () => {
+        const exit = await exitOf(UNTIL_STDIN_CLOSES, proc => {
+          // Threads the agent's thread starts take its name too; it is the first.
+          const tid = readdirSync(`/proc/${proc.pid}/task`)
+            .map(Number)
+            .sort((a, b) => a - b)
+            .find(tid => readFileSync(`/proc/${proc.pid}/task/${tid}/comm`, "utf8").trim() === thread)!;
+          expect(tgkill!(proc.pid, tid, 15)).toBe(0);
+        });
+        expect({ code: exit.code, signal: exit.signal, signalCode: exit.signalCode }).toEqual({
+          code: 15,
+          signal: "SIGTERM",
+          signalCode: "SIGTERM",
+        });
       });
-      await gateway.next("ExportInfo");
-
-      const reported = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
-      const blocked: Record<string, string[]> = {};
-      for (const tid of readdirSync(`/proc/${proc.pid}/task`)) {
-        const status = readFileSync(`/proc/${proc.pid}/task/${tid}/status`, "utf8");
-        const name = Number(tid) === proc.pid ? "main" : status.match(/^Name:\t(.*)$/m)![1];
-        if (name !== "main" && name !== "NSolidAgent" && name !== "NSolidSignal") continue;
-        const mask = BigInt("0x" + status.match(/^SigBlk:\t([0-9a-f]+)$/m)![1]);
-        blocked[name] = Object.entries(reported)
-          .filter(([, signal]) => (mask >> BigInt(signal - 1)) & 1n)
-          .map(([signalName]) => signalName);
-      }
-      expect(blocked).toEqual({
-        main: [],
-        NSolidAgent: ["SIGHUP", "SIGINT", "SIGTERM"],
-        NSolidSignal: ["SIGHUP", "SIGINT", "SIGTERM"],
-      });
-    });
+    }
   });
 
   test.concurrent("reads its configuration with N|Solid's precedence and validation", async () => {

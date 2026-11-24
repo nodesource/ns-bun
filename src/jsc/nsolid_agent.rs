@@ -61,12 +61,15 @@ pub fn record_fatal_error(global: &JSGlobalObject, error: JSValue) {
 /// handles the signal, then lets the signal end the process. The handler only
 /// writes the signal to a pipe and waits on another, which are
 /// async-signal-safe; a thread of its own does the reporting. The handler
-/// waits on that thread and on the agent's, so both block the signals.
+/// waits on that thread and on the agent's, so a signal the kernel gives
+/// either of them goes on to the main thread. Masks can't keep it off the
+/// agent's: its event loop waits with every signal unblocked.
 #[cfg(unix)]
 mod signals {
     use bun_sys::Fd;
+    use core::cell::Cell;
     use core::ffi::{CStr, c_int};
-    use core::sync::atomic::{AtomicI32, Ordering};
+    use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
     const SIGNALS: [(c_int, &CStr); 3] = [
         (libc::SIGINT, c"SIGINT"),
@@ -78,6 +81,16 @@ mod signals {
 
     static TO_REPORTER: AtomicI32 = AtomicI32::new(-1);
     static FROM_REPORTER: AtomicI32 = AtomicI32::new(-1);
+    static MAIN_THREAD: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        static WAITED_ON: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Marks the calling thread as one the handler waits on.
+    pub(super) fn handled_elsewhere() {
+        WAITED_ON.set(true);
+    }
 
     fn pipe() -> Option<[c_int; 2]> {
         let mut fds = [0; 2];
@@ -99,11 +112,11 @@ mod signals {
         };
         TO_REPORTER.store(to_reporter[1], Ordering::Relaxed);
         FROM_REPORTER.store(from_reporter[0], Ordering::Relaxed);
-        let spawned = blocked_while(|| {
-            std::thread::Builder::new()
-                .name("NSolidSignal".to_string())
-                .spawn(move || report_signals(to_reporter[0], from_reporter[1]))
-        });
+        // SAFETY: no preconditions.
+        MAIN_THREAD.store(unsafe { libc::pthread_self() } as usize, Ordering::Relaxed);
+        let spawned = std::thread::Builder::new()
+            .name("NSolidSignal".to_string())
+            .spawn(move || report_signals(to_reporter[0], from_reporter[1]));
         if spawned.is_err() {
             return;
         }
@@ -125,32 +138,18 @@ mod signals {
         }
     }
 
-    /// Runs `spawn` with the signals blocked on this thread, so that the thread
-    /// it starts begins with them blocked, as do the threads that one starts.
-    pub(super) fn blocked_while<T>(spawn: impl FnOnce() -> T) -> T {
-        let mut set: libc::sigset_t = bun_core::ffi::zeroed();
-        let mut previous: libc::sigset_t = bun_core::ffi::zeroed();
-        // SAFETY: both sets are valid memory; sigemptyset initializes `set`.
-        unsafe {
-            libc::sigemptyset(&raw mut set);
-            for (signal, _) in SIGNALS {
-                libc::sigaddset(&raw mut set, signal);
-            }
-            libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, &raw mut previous);
-        }
-        let spawned = spawn();
-        // SAFETY: `previous` is the mask pthread_sigmask returned above.
-        unsafe {
-            libc::pthread_sigmask(
-                libc::SIG_SETMASK,
-                &raw const previous,
-                core::ptr::null_mut(),
-            )
-        };
-        spawned
-    }
-
     extern "C" fn on_signal(signal: c_int) {
+        if WAITED_ON.get() {
+            // SAFETY: pthread_kill(3) is async-signal-safe, and the main thread
+            // outlives the process's signal handling.
+            unsafe {
+                libc::pthread_kill(
+                    MAIN_THREAD.load(Ordering::Relaxed) as libc::pthread_t,
+                    signal,
+                )
+            };
+            return;
+        }
         let to_reporter = Fd::from_native(TO_REPORTER.load(Ordering::Relaxed));
         // write(2), poll(2), signal(2) and raise(3) are async-signal-safe.
         if matches!(bun_sys::write(to_reporter, &[signal as u8]), Ok(1)) {
@@ -170,6 +169,7 @@ mod signals {
     }
 
     fn report_signals(from_handler: c_int, to_handler: c_int) {
+        handled_elsewhere();
         let (from_handler, to_handler) =
             (Fd::from_native(from_handler), Fd::from_native(to_handler));
         let mut byte = [0u8];
@@ -262,16 +262,10 @@ fn start(vm: &VirtualMachine) {
     };
     // A full `VirtualMachine::init` plus module load needs more than the
     // 2 MiB default stack, as for the Debugger thread.
-    let spawn = move || {
-        std::thread::Builder::new()
-            .name("NSolidAgent".to_string())
-            .stack_size(16 * 1024 * 1024)
-            .spawn(move || agent_thread(env_map, main_path, main_entry))
-    };
-    #[cfg(unix)]
-    let spawned = signals::blocked_while(spawn);
-    #[cfg(not(unix))]
-    let spawned = spawn();
+    let spawned = std::thread::Builder::new()
+        .name("NSolidAgent".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || agent_thread(env_map, main_path, main_entry));
     if spawned.is_err() {
         bun_core::scoped_log!(nsolid_agent, "could not spawn the agent thread");
     }
@@ -279,6 +273,8 @@ fn start(vm: &VirtualMachine) {
 
 fn agent_thread(env_map: bun_dotenv::Map, main_path: Vec<u8>, main_entry: f64) {
     let agent_thread = since_process_start_ns();
+    #[cfg(unix)]
+    signals::handled_elsewhere();
     bun_core::asan::disable_leak_checks_on_current_thread();
     bun_core::Output::Source::configure_named_thread(bun_core::zstr!("NSolidAgent"));
     jsc::mark_binding();
