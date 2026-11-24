@@ -567,7 +567,7 @@ function traceQuery(operation: number, args: unknown[], promise: Promise<unknown
     result => {
       record(Measure.DnsDone, performance.now() - started);
       if (span !== undefined) {
-        if (operation === 0) span.setAttribute("dns.address", JSON.stringify(addressesOf(result)));
+        if (operation === 0) span.setAttribute("dns.address", JSON.stringify(lookupAnswer(result, args[1])));
         else if (operation === 1) span.setAttribute("dns.hostname", String((result as unknown[])?.[0]));
         else span.setAttribute("dns.address", JSON.stringify(result));
         span.end();
@@ -582,11 +582,18 @@ function traceQuery(operation: number, args: unknown[], promise: Promise<unknown
   );
 }
 
-// A lookup's answer as N|Solid records it: the address, or the addresses with their families.
-function addressesOf(result: unknown) {
-  if (!$isArray(result)) return result;
-  if (result.length === 1) return (result[0] as { address?: unknown })?.address;
-  return result.map(entry => ({ address: entry?.address, family: entry?.family }));
+// A lookup's answer as N|Solid records it: the address the caller gets (node:dns orders the resolver's list by the
+// lookup's `order`, then takes the first), or with `all` every address with its family.
+function lookupAnswer(result: unknown, options: any) {
+  if (!$isArray(result) || result.length === 0) return result;
+  if (options?.all) return result.map(entry => ({ address: entry?.address, family: entry?.family }));
+  const order = options?.order;
+  let first = result[0];
+  if (order === "ipv4first" || order === "ipv6first") {
+    const family = order === "ipv4first" ? 4 : 6;
+    first = result.find(entry => entry?.family === family) ?? first;
+  }
+  return first?.address;
 }
 
 function install() {

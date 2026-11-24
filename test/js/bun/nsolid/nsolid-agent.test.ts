@@ -1997,16 +1997,31 @@ describe("N|Solid agent", () => {
 
     test.concurrent("of node:dns, with its counts and latencies in the thread's metrics", async () => {
       await using gateway = await grpcGateway([]);
-      const script = `setInterval(() => require("node:dns").promises.lookup("localhost").catch(() => {}), 50);`;
+      const script = `
+        const { lookup } = require("node:dns").promises;
+        setInterval(() => {
+          lookup("localhost").catch(() => {});
+          lookup("localhost", { all: true }).catch(() => {});
+        }, 50);`;
       await using proc = spawnAgent(gateway, script, { NSOLID_TRACING_ENABLED: "1", NSOLID_INTERVAL: "100" });
-      const span = await spansUntil(gateway, spans => spans.find(span => span.name === "DNS lookup"));
-      const { "dns.address": address, ...attributes } = span.attributes;
-      expect({ kind: span.kind, parentSpanId: span.parentSpanId, attributes }).toEqual({
+      // A lookup records the address it returns; one with `all` records every address, with its family.
+      const answerOf = (span: any) => JSON.parse(span.attributes["dns.address"]);
+      const [one, all] = await spansUntil(gateway, spans => {
+        const lookups = spans.filter(span => span.name === "DNS lookup");
+        const one = lookups.find(span => typeof answerOf(span) === "string");
+        const all = lookups.find(span => Array.isArray(answerOf(span)));
+        if (one && all) return [one, all];
+      });
+      const { "dns.address": _, ...attributes } = one.attributes;
+      expect({ kind: one.kind, parentSpanId: one.parentSpanId, attributes }).toEqual({
         kind: 3,
         parentSpanId: "",
         attributes: { "dns.op_type": 0, "dns.hostname": "localhost", "thread.id": 0, "nsolid.span_type": 1 },
       });
-      expect(JSON.parse(address)).toBeTypeOf("string");
+      const addresses = answerOf(all);
+      expect(addresses.length).toBeGreaterThan(0);
+      expect(addresses.map((entry: any) => entry.address)).toContain(answerOf(one));
+      for (const entry of addresses) expect([4, 6]).toContain(entry.family);
       for (;;) {
         const request = await gateway.next("MetricsExport");
         if (Number(metricPoint(request, "dnsCount").sum.data_points[0].as_int) > 0) break;
