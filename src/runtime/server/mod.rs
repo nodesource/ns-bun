@@ -88,6 +88,10 @@ pub(crate) use server_web_socket::ServerWebSocket;
 pub(crate) mod node_http_response;
 pub(crate) use node_http_response::NodeHTTPResponse;
 
+#[path = "ServeTrace.rs"]
+pub(crate) mod serve_trace;
+pub(crate) use serve_trace::ServeTrace;
+
 #[path = "RequestContext.rs"]
 pub(crate) mod request_context;
 pub(crate) use request_context::RequestContext as NewRequestContext;
@@ -1043,6 +1047,9 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
         req: &mut uws_sys::Request,
         response_value: JSValue,
     ) {
+        if let Some(trace) = ServeTrace::take(self.global_this()) {
+            ctx.set_serve_trace(trace);
+        }
         let Some(ctx) = ServerRequestContext::respond(ctx, self, request.to_js(), response_value)
         else {
             return;
@@ -1081,10 +1088,11 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
 
         let global = self.global_this();
         let request = DispatchedRequest(request.wrap(global));
-        let response_value = match on_request.call(global, js_value, &[request.to_js(), js_value]) {
-            Ok(v) => v,
-            Err(err) => global.take_exception(err),
-        };
+        let response_value =
+            match serve_trace::call_fetch_handler(global, on_request, request.to_js(), js_value) {
+                Ok(v) => v,
+                Err(err) => global.take_exception(err),
+            };
 
         self.handle_request(&request, ctx, req, response_value);
     }

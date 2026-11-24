@@ -251,10 +251,18 @@ JSValue ServerRouteList::callRoute(Zig::GlobalObject* globalObject, uint32_t ind
     ASSERT(callback);
     JSValue serverValue = JSValue::decode(serverObject);
     MarkedArgumentBuffer args;
+    // Through the hook of the bun:serve:request channels while they have subscribers
+    // (internal/serve_channels.ts), which calls the route the same way.
+    JSObject* hook = globalObject->diagnosticsHook(DiagnosticsHook::Serve);
+    if (hook) {
+        args.append(jsNumber(0));
+        args.append(callback);
+        args.append(serverValue);
+    }
     args.append(request);
     args.append(serverValue);
 
-    auto result = AsyncContextFrame::call(globalObject, callback, serverValue, args);
+    auto result = hook ? AsyncContextFrame::call(globalObject, hook, jsUndefined(), args) : AsyncContextFrame::call(globalObject, callback, serverValue, args);
     RETURN_IF_EXCEPTION(scope, {});
     return result;
 }

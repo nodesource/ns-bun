@@ -10,7 +10,7 @@ use bun_ptr::{AliasableBox, AnyRefCounted, RefPtr};
 use bun_uws::{self as uws, WebSocketUpgradeContext};
 
 use crate::server::jsc::{self, JSGlobalObject, JSValue, JsResult};
-use crate::server::{PendingRequest, RangeRequest, ServerLike};
+use crate::server::{PendingRequest, RangeRequest, ServeTrace, ServerLike};
 use crate::webcore::{
     self as WebCore, AnyBlob, ByteStream, CookieMap, CookieMapRef, FetchHeaders, Request, Response,
     blob::SizeType as BlobSizeType, body, readable_stream, request, response,
@@ -168,6 +168,9 @@ pub(crate) struct RequestContext<
     /// Used either for temporary blob data or fallback
     /// When the response body is a temporary value
     pub(crate) response_buf_owned: JsCell<Vec<u8>>,
+    /// While the `bun:serve:request` channels have subscribers: the request's
+    /// published start, which its end is published with.
+    serve_trace: JsCell<Option<ServeTrace>>,
 
     /// The dev server's record of this request. The response has room for one abort handler only.
     pub(crate) deferred_request: Cell<Option<crate::bake::dev_server::deferred_request::Handle>>,
@@ -1076,6 +1079,7 @@ where
         if let Some(resp) = ctx.resp.get() {
             if !DEBUG_MODE {
                 if !ctx.flags.has_written_status() {
+                    self.note_status(204);
                     resp.write_status(b"204 No Content");
                 }
                 ctx.flags.set_has_written_status(true);
@@ -1089,6 +1093,7 @@ where
             }
 
             if ctx.flags.is_web_browser_navigation() {
+                self.note_status(200);
                 resp.write_status(b"200 OK");
                 ctx.flags.set_has_written_status(true);
 
@@ -1104,6 +1109,7 @@ where
             }
             const MISSING_CONTENT: &[u8] =
                 b"Welcome to Bun! To get started, return a Response object.";
+            self.note_status(200);
             resp.write_status(b"200 OK");
             resp.write_header(b"content-type", &bun_http_types::MimeType::TEXT.value);
             resp.write_header_int(b"content-length", MISSING_CONTENT.len() as u64);
@@ -1128,6 +1134,7 @@ where
         let Some(resp) = self.resp.get() else { return };
         if !self.flags.has_written_status() {
             self.flags.set_has_written_status(true);
+            self.note_status(500);
             resp.write_status(b"500 Internal Server Error");
             resp.write_header(b"content-type", &bun_http_types::MimeType::HTML.value);
         }
@@ -1223,6 +1230,7 @@ where
         // `resp` may be freed (see above); the sink resumed it at `ended_response = true`.
         self.flags.set_request_body_paused(false);
         if let Some((_, _base_ref)) = self.resp.take() {
+            self.end_serve_trace();
             self.flags.set_is_waiting_for_request_body(false);
             self.flags.set_has_abort_handler(false);
             self.request_body_buf.set(Vec::new());
@@ -1260,6 +1268,7 @@ where
     pub(crate) fn end_with_internal_server_error(&self) {
         if let Some(resp) = self.resp.get() {
             self.flags.set_has_written_status(true);
+            self.note_status(500);
             resp.write_status(b"500 Internal Server Error");
             resp.write_header_int(b"Content-Length", 0);
         }
@@ -1281,6 +1290,7 @@ where
         }
         if !resp.has_responded() {
             self.flags.set_has_written_status(true);
+            self.note_status(413);
             resp.write_status(b"413 Payload Too Large");
         }
         // The normal end path detaches `self.resp` and releases the base ref. uWS
@@ -1404,6 +1414,7 @@ where
                 response_body_readable_stream_ref: JsCell::new(readable_stream::Strong::default()),
                 pathname: JsCell::new(BunString::EMPTY),
                 response_buf_owned: JsCell::new(Vec::new()),
+                serve_trace: JsCell::new(None),
                 deferred_request: Cell::new(None),
                 promise_cell: Cell::new(JSValue::ZERO),
             });
@@ -1549,6 +1560,7 @@ where
 
         self.response_root.clear();
         self.response_weakref.set(response::WeakRef::EMPTY);
+        drop(self.serve_trace.take());
 
         // The stream ref itself is errored and released by `end_request_streaming()` below.
         self.detach_request_body_producer();
@@ -2349,9 +2361,29 @@ where
         Ok(any_js_calls)
     }
 
+    pub(crate) fn set_serve_trace(&self, trace: ServeTrace) {
+        self.serve_trace.set(Some(trace));
+    }
+
+    fn note_status(&self, status: u16) {
+        if let Some(trace) = self.serve_trace.get() {
+            trace.note_status(status);
+        }
+    }
+
+    /// The response is done with: publish the end of its request.
+    fn end_serve_trace(&self) {
+        if let Some(trace) = self.serve_trace.take()
+            && self.server.get().is_some()
+        {
+            trace.end(self.server().global_this(), self.flags.aborted());
+        }
+    }
+
     #[must_use = "dropping it releases the base ref"]
     pub(crate) fn detach_response(&self) -> Option<RefPtr<Self>> {
         let (resp, base_ref) = self.resp.take()?;
+        self.end_serve_trace();
         self.request_body_buf.set(Vec::new());
         // The sink writes through its own handle to the response.
         if let Some(sink) = self.sink_mut() {
@@ -3395,6 +3427,7 @@ where
             match status {
                 404 => {
                     if !self.flags.has_written_status() {
+                        self.note_status(404);
                         resp.write_status(b"404 Not Found");
                         self.flags.set_has_written_status(true);
                     }
@@ -3403,6 +3436,7 @@ where
                 _ => {
                     const BODY: &[u8] = b"Something went wrong!";
                     if !self.flags.has_written_status() {
+                        self.note_status(500);
                         resp.write_status(b"500 Internal Server Error");
                         resp.write_header(b"content-type", b"text/plain");
                         self.flags.set_has_written_status(true);
@@ -3755,6 +3789,7 @@ where
     fn do_write_status(&self, status: u16) {
         debug_assert!(!self.flags.has_written_status());
         self.flags.set_has_written_status(true);
+        self.note_status(status);
 
         // `AnyResponse` is a `Copy` handle; methods take `self` by value.
         let Some(resp) = self.resp.get() else { return };

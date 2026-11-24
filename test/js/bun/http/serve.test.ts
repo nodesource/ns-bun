@@ -5733,3 +5733,92 @@ it("Proxy-Connection: close does not end a Bun.serve connection", async () => {
     socket.destroy();
   }
 });
+
+describe("diagnostics_channel", () => {
+  const dc = require("node:diagnostics_channel");
+  const { AsyncLocalStorage } = require("node:async_hooks");
+
+  // The events of one server, as [channel, path, statusCode, aborted, store seen by the handler].
+  function recordServeEvents() {
+    const events: unknown[][] = [];
+    const als = new AsyncLocalStorage();
+    const start = dc.channel("bun:serve:request:start");
+    const end = dc.channel("bun:serve:request:end");
+    const onStart = (message: any) => events.push(["start", new URL(message.request.url).pathname]);
+    const onEnd = (message: any) =>
+      events.push(["end", new URL(message.request.url).pathname, message.statusCode, message.aborted]);
+    start.bindStore(als, (message: any) => `store of ${new URL(message.request.url).pathname}`);
+    start.subscribe(onStart);
+    end.subscribe(onEnd);
+    return {
+      events,
+      als,
+      [Symbol.dispose]() {
+        start.unsubscribe(onStart);
+        end.unsubscribe(onEnd);
+        start.unbindStore(als);
+      },
+    };
+  }
+
+  it("publishes each request's start and end, with the handler in the channel's stores", async () => {
+    using recorded = recordServeEvents();
+    const seen: unknown[] = [];
+    using server = serve({
+      port: 0,
+      routes: {
+        "/route/:id": req => {
+          seen.push(recorded.als.getStore());
+          return new Response(req.params.id, { status: 201 });
+        },
+      },
+      async fetch(req) {
+        await Bun.sleep(0);
+        seen.push(recorded.als.getStore());
+        if (new URL(req.url).pathname === "/throws") throw new Error("handler failed");
+        return new Response("ok");
+      },
+      error() {
+        return new Response("failed", { status: 500 });
+      },
+    });
+    expect((await fetch(new URL("/fetch", server.url))).status).toBe(200);
+    expect((await fetch(new URL("/route/7", server.url))).status).toBe(201);
+    expect((await fetch(new URL("/throws", server.url))).status).toBe(500);
+    await Bun.sleep(0);
+    expect({ events: recorded.events, seen }).toEqual({
+      events: [
+        ["start", "/fetch"],
+        ["end", "/fetch", 200, false],
+        ["start", "/route/7"],
+        ["end", "/route/7", 201, false],
+        ["start", "/throws"],
+        ["end", "/throws", 500, false],
+      ],
+      seen: ["store of /fetch", "store of /route/7", "store of /throws"],
+    });
+  });
+
+  it("publishes the end of a request the client aborted", async () => {
+    using recorded = recordServeEvents();
+    const { promise: aborted, resolve: onAbort } = Promise.withResolvers<void>();
+    using server = serve({
+      port: 0,
+      fetch(req) {
+        req.signal.addEventListener("abort", () => onAbort());
+        return new Promise(() => {});
+      },
+    });
+    const controller = new AbortController();
+    const request = fetch(new URL("/hangs", server.url), { signal: controller.signal }).catch(() => {});
+    while (recorded.events.length === 0) await Bun.sleep(1);
+    controller.abort();
+    await request;
+    await aborted;
+    while (recorded.events.length < 2) await Bun.sleep(1);
+    expect(recorded.events).toEqual([
+      ["start", "/hangs"],
+      ["end", "/hangs", 0, true],
+    ]);
+  });
+});

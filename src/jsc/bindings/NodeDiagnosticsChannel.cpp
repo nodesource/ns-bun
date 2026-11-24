@@ -26,6 +26,7 @@ static std::optional<DiagnosticsHook> hookOfName(StringView name)
         { "sqlite.db.query"_s, DiagnosticsHook::SqliteQuery },
         { "undici:request"_s, DiagnosticsHook::Request },
         { "undici:websocket"_s, DiagnosticsHook::WebSocket },
+        { "bun:serve:request"_s, DiagnosticsHook::Serve },
     };
     static_assert(std::size(hooks) == static_cast<size_t>(DiagnosticsHook::Count));
     for (auto& [text, hook] : hooks) {
@@ -182,6 +183,11 @@ extern "C" [[ZIG_EXPORT(nothrow)]] JSC::EncodedJSValue Bun__consoleLogDiagnostic
 extern "C" [[ZIG_EXPORT(nothrow)]] JSC::EncodedJSValue Bun__requestDiagnosticsHook(JSC::JSGlobalObject* globalObject)
 {
     return JSValue::encode(defaultGlobalObject(globalObject)->diagnosticsHook(DiagnosticsHook::Request));
+}
+
+extern "C" [[ZIG_EXPORT(nothrow)]] JSC::EncodedJSValue Bun__serveDiagnosticsHook(JSC::JSGlobalObject* globalObject)
+{
+    return JSValue::encode(defaultGlobalObject(globalObject)->diagnosticsHook(DiagnosticsHook::Serve));
 }
 
 // Holding on to it does not keep a Bun.ModuleGraph alive.
