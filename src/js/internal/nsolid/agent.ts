@@ -366,7 +366,7 @@ class Agent {
   traceFlags = 0;
   traceSampleRate = 1;
   // Spans the threads ended, waiting for the next export.
-  spans: otlp.EndedSpan[] = [];
+  spans: any[] = [];
   // Continuous CPU profiles: each thread's running window, and the threads one is starting on.
   windows = new Map<number, { contextId: number; startEpochMs: number; startPerf: number; intervalMs: number }>();
   startingWindows = new Set<number>();
@@ -513,7 +513,7 @@ class Agent {
     if (kept !== undefined) code = Buffer.from(kept);
     else {
       try {
-        code = await fs.promises.readFile(filePathOf(script.url));
+        code = fs.readFileSync(filePathOf(script.url));
       } catch {
         return reply({ error: RUNTIME_ERROR });
       }
@@ -564,7 +564,7 @@ class Agent {
   // `nsolid.logger` lines, sent as N|Solid sends them: all that are queued, at once, and dropped while there is no
   // connection.
   exportLogs() {
-    const logs = takeLogs() as otlp.QueuedLog[];
+    const logs = takeLogs() as any[];
     if (!logs.length || !this.session) return;
     const identity = this.otlpIdentity();
     for (let i = 0; i < logs.length; i += OTLP_BATCH) {
@@ -575,7 +575,7 @@ class Agent {
     }
   }
 
-  otlpIdentity(): otlp.Identity {
+  otlpIdentity() {
     return {
       agentId: this.agentId,
       app: this.config.app,

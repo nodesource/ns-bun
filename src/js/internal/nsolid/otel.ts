@@ -53,7 +53,7 @@ class ContextManager {
   #bindFunction(context, target) {
     const manager = this;
     function contextWrapper(this: unknown, ...args) {
-      return manager.with(context, () => target.$apply(this, args));
+      return manager.with(context, () => target.$apply(this, args), undefined);
     }
     Object.defineProperty(contextWrapper, "length", {
       enumerable: false,
@@ -106,7 +106,7 @@ const contextManager = new ContextManager();
 
 class Tracer {
   // N|Solid's: no span while tracing is off; a root decides sampling, a child takes its parent's.
-  startSpan(name, options = {}, context?) {
+  startSpan(name, options: any = {}, context?) {
     const otel = api();
     if (tracing.traceFlags === 0) return otel.trace.wrapSpanContext(INVALID_SPAN_CONTEXT);
     context ||= otel.context.active();

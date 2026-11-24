@@ -2188,7 +2188,9 @@ describe("N|Solid agent", () => {
     const countsWhen = async (done: (counts: Record<string, number>) => boolean) => {
       for (;;) {
         const request = await gateway.next("MetricsExport");
-        const counts = Object.fromEntries([...counters, "activeHandles"].map(name => [name, mainThread(request, name)]));
+        const counts = Object.fromEntries(
+          [...counters, "activeHandles"].map(name => [name, mainThread(request, name)]),
+        );
         if (done(counts)) return counts;
       }
     };
@@ -2213,7 +2215,9 @@ describe("N|Solid agent", () => {
 
     proc.stdin.write("close\n");
     expect(await nextLine()).toBe("closed");
-    const closed = await countsWhen(counts => counts.tcpSocketDestroyedCount === 2 && counts.fsHandlesClosedCount === 1);
+    const closed = await countsWhen(
+      counts => counts.tcpSocketDestroyedCount === 2 && counts.fsHandlesClosedCount === 1,
+    );
     const { activeHandles: activeAfter, ...closedCounts } = closed;
     expect(closedCounts).toEqual({
       tcpServerCreatedCount: 1,

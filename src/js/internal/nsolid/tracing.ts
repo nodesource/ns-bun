@@ -24,7 +24,7 @@ const KIND_CLIENT = 3;
 const STATUS_OK = 1;
 const STATUS_ERROR = 2;
 // Keep in sync with NSolidAgent.cpp
-const enum Record {
+const enum Measure {
   HttpClient,
   HttpClientAbort,
   HttpServer,
@@ -364,7 +364,7 @@ interface Exchange {
   ended?: boolean;
 }
 
-function serveContextOf(message: { request: Request; [kServe]?: Exchange }): Context {
+function serveContextOf(message: any): Context {
   const { request } = message;
   const exchange: Exchange = { started: performance.now(), span: undefined };
   message[kServe] = exchange;
@@ -376,10 +376,10 @@ function serveContextOf(message: { request: Request; [kServe]?: Exchange }): Con
   return withSpan(parent, span);
 }
 
-function serveEnded(message: { statusCode: number; aborted: boolean; [kServe]?: Exchange }) {
+function serveEnded(message: any) {
   const exchange = message[kServe];
   if (exchange === undefined) return;
-  record(message.aborted ? Record.HttpServerAbort : Record.HttpServer, performance.now() - exchange.started);
+  record(message.aborted ? Measure.HttpServerAbort : Measure.HttpServer, performance.now() - exchange.started);
   const span = exchange.span;
   if (span === undefined) return;
   const { statusCode } = message;
@@ -406,7 +406,7 @@ function httpServerRequest(request: any, response: any): Disposable {
     if (exchange.ended) return;
     exchange.ended = true;
     const aborted = !response.writableFinished;
-    record(aborted ? Record.HttpServerAbort : Record.HttpServer, performance.now() - exchange.started);
+    record(aborted ? Measure.HttpServerAbort : Measure.HttpServer, performance.now() - exchange.started);
     const span = exchange.span;
     if (span === undefined) return;
     if (response.headersSent) {
@@ -427,7 +427,7 @@ function httpServerRequest(request: any, response: any): Disposable {
 // node:http's client, from its channels.
 const kClient = Symbol("nsolid.client");
 
-function clientCreated({ request }: { request: any }) {
+function clientCreated({ request }: any) {
   const exchange: Exchange = { started: performance.now(), span: undefined };
   request[kClient] = exchange;
   if ((traceFlags & SPAN_HTTP_CLIENT) === 0) return;
@@ -444,10 +444,10 @@ function clientCreated({ request }: { request: any }) {
   } catch {}
 }
 
-function clientResponse({ request, response }: { request: any; response: any }) {
+function clientResponse({ request, response }: any) {
   const exchange: Exchange | undefined = request[kClient];
   if (exchange === undefined) return;
-  record(Record.HttpClient, performance.now() - exchange.started);
+  record(Measure.HttpClient, performance.now() - exchange.started);
   const span = exchange.span;
   if (span === undefined) return;
   span.setAttribute("http.status_code", response.statusCode);
@@ -457,11 +457,11 @@ function clientResponse({ request, response }: { request: any; response: any }) 
   response.once("close", end);
 }
 
-function clientError({ request, error }: { request: any; error: any }) {
+function clientError({ request, error }: any) {
   const exchange: Exchange | undefined = request[kClient];
   if (exchange === undefined || exchange.ended) return;
   exchange.ended = true;
-  record(Record.HttpClientAbort, 0);
+  record(Measure.HttpClientAbort, 0);
   failed(exchange.span, error, { "http.error_name": error?.name, "http.error_message": error?.message });
 }
 
@@ -476,7 +476,7 @@ function failed(span: Span | undefined, error: any, attributes?: Attributes) {
 // fetch(), from the undici channels Bun publishes (internal/undici_channels.ts).
 const fetches = new WeakMap<object, Exchange>();
 
-function fetchCreated({ request }: { request: any }) {
+function fetchCreated({ request }: any) {
   const exchange: Exchange = { started: performance.now(), span: undefined };
   fetches.set(request, exchange);
   if ((traceFlags & SPAN_HTTP_CLIENT) === 0) return;
@@ -488,29 +488,29 @@ function fetchCreated({ request }: { request: any }) {
   } catch {}
 }
 
-function fetchHeaders({ request, response }: { request: any; response: any }) {
+function fetchHeaders({ request, response }: any) {
   const exchange = fetches.get(request);
   const status = response?.statusCode;
   if (exchange === undefined || (status < 200 && status !== 101)) return;
-  record(Record.HttpClient, performance.now() - exchange.started);
+  record(Measure.HttpClient, performance.now() - exchange.started);
   const span = exchange.span;
   if (span === undefined) return;
   span.setAttribute("http.status_code", status);
   if (status >= 400) span.setStatus({ code: STATUS_ERROR });
 }
 
-function fetchEnded({ request }: { request: any }) {
+function fetchEnded({ request }: any) {
   const exchange = fetches.get(request);
   if (exchange === undefined) return;
   fetches.delete(request);
   exchange.span?.end();
 }
 
-function fetchError({ request, error }: { request: any; error: any }) {
+function fetchError({ request, error }: any) {
   const exchange = fetches.get(request);
   if (exchange === undefined) return;
   fetches.delete(request);
-  record(Record.HttpClientAbort, 0);
+  record(Measure.HttpClientAbort, 0);
   failed(exchange.span, error);
 }
 
@@ -552,7 +552,7 @@ function dnsResolver<T extends object>(resolver: T): T {
 }
 
 function traceQuery(operation: number, args: unknown[], promise: Promise<unknown>) {
-  record(Record.DnsCall, 0);
+  record(Measure.DnsCall, 0);
   const started = performance.now();
   let span: Span | undefined;
   if ((traceFlags & SPAN_DNS) !== 0) {
@@ -565,7 +565,7 @@ function traceQuery(operation: number, args: unknown[], promise: Promise<unknown
   }
   return promise.then(
     result => {
-      record(Record.DnsDone, performance.now() - started);
+      record(Measure.DnsDone, performance.now() - started);
       if (span !== undefined) {
         if (operation === 0) span.setAttribute("dns.address", JSON.stringify(addressesOf(result)));
         else if (operation === 1) span.setAttribute("dns.hostname", String((result as unknown[])?.[0]));
@@ -575,7 +575,7 @@ function traceQuery(operation: number, args: unknown[], promise: Promise<unknown
       return result;
     },
     error => {
-      record(Record.DnsDone, performance.now() - started);
+      record(Measure.DnsDone, performance.now() - started);
       span?.end();
       throw error;
     },
