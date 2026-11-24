@@ -505,6 +505,14 @@ impl UpgradeCommand {
 
     #[cold]
     pub(crate) fn exec(ctx: Command::Context) -> crate::Result<()> {
+        // An upgrade from oven-sh's releases would replace nsolid-bun with a
+        // Bun without the N|Solid agent.
+        if Global::NSOLID_BUN {
+            bun_core::pretty_errorln!(
+                "<r><red>error<r><d>:<r> nsolid-bun does not upgrade itself: `bun upgrade` would replace it with Bun from oven-sh, without the N|Solid agent.\n<blue>note<r><d>:<r> New versions of nsolid-bun are at <cyan>https://github.com/nodesource/ns-bun/releases<r>"
+            );
+            Global::exit(1);
+        }
         let args = bun_core::argv();
         if args.len() > 2 {
             for arg in args.iter().skip(2) {

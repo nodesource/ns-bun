@@ -1,0 +1,56 @@
+name: nsolid-webkit-mirror
+
+# Copies the WebKit prebuilts that nsolid-bun builds from (the oven-sh/WebKit
+# release that WEBKIT_VERSION pins: the Linux tarballs and the AoT sources)
+# to a release of this repository under the same tag. Every file is checked
+# against scripts/build/deps/webkit.sha256 before it is uploaded, and the
+# build checks it again when it downloads it.
+#
+# nsolid-bun.yml builds from the mirror when the repository variable
+# NSOLID_WEBKIT_MIRROR is set to
+# https://github.com/<owner>/<repo>/releases/download. Run this workflow
+# after each WEBKIT_VERSION bump.
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    name: Mirror the pinned WebKit release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Copy the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pins="$PWD/scripts/build/deps/webkit.sha256"
+          tag=$(sed -E 's#^[0-9a-f]{64}  ([^/]+)/.*$#\1#' "$pins" | sort -u)
+          if [ "$(printf '%s\n' "$tag" | wc -l)" != 1 ]; then
+            echo "webkit.sha256 names more than one release: $tag" >&2
+            exit 1
+          fi
+          mkdir -p mirror && cd mirror
+          gh release download "$tag" --repo oven-sh/WebKit \
+            --pattern 'bun-webkit-linux-*.tar.gz' --pattern 'bun-webkit-aot-sources.tar.gz'
+          # Each downloaded file against its pin; a file without one fails.
+          for file in *.tar.gz; do
+            expected=$(grep -F "  $tag/$file" "$pins" | cut -d' ' -f1)
+            if [ -z "$expected" ]; then
+              echo "$file has no pin in webkit.sha256" >&2
+              exit 1
+            fi
+            echo "$expected  $file" | sha256sum -c -
+          done
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" \
+              --title "WebKit $tag (mirror)" \
+              --notes "The WebKit prebuilts of oven-sh/WebKit's $tag release that nsolid-bun builds from, checked against scripts/build/deps/webkit.sha256."
+          fi
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber ./*.tar.gz

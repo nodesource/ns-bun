@@ -108,7 +108,7 @@ function packages(callback?: (err: null, packages: object[]) => void) {
     !config.disablePackageScan,
     config.trackGlobalPackages ? (require("node:module").globalPaths ?? []) : [],
   );
-  return maybeCallback(inventory.packagesOf(loadedModules()).slice(), callback);
+  return maybeCallback(inventory.packagesAtOnce(loadedModules()).slice(), callback);
 }
 
 Object.assign(start, { start, id, info, metrics, packages });

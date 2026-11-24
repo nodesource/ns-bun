@@ -268,6 +268,8 @@ class Agent {
   // N|Solid does: CPU percentages stay measured over a whole interval.
   lastMetrics: object | undefined;
   inventory;
+  // One `packages` answer at a time: a second waits for the scan the first started.
+  packagesRun: Promise<unknown> = Promise.resolve();
 
   constructor(
     endpoint: Endpoint,
@@ -307,7 +309,7 @@ class Agent {
       "te": "trailers",
       "grpc-accept-encoding": "identity",
       "nsolid-agent-id": agentId,
-      "nsolid-version": `bun-v${Bun.version}`,
+      "nsolid-version": `nsolid-bun-v${process.versions.nsolid_bun}+bun-v${Bun.version}`,
     };
     if (endpoint.saasToken) this.metadata["nsolid-saas"] = endpoint.saasToken;
     this.scheduleMetrics();
@@ -518,7 +520,9 @@ class Agent {
       }
       case "packages": {
         const modules = await requests.ask(requestLoadedModules, MAIN_CONTEXT_ID, LOADED_MODULES_TIMEOUT_MS);
-        const packages = this.inventory.packagesOf(modules ?? []);
+        const run = this.packagesRun.then(() => this.inventory.packagesLater(modules ?? []));
+        this.packagesRun = run.catch(() => {});
+        const packages = await run;
         return this.send(rpc, { common: this.common(request), body: { packages } });
       }
       case "metrics": {

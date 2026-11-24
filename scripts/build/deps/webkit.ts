@@ -98,7 +98,8 @@ function prebuiltUrl(cfg: Config): string {
   const os = cfg.windows ? "windows" : cfg.darwin ? "macos" : cfg.freebsd ? "freebsd" : "linux";
   const arch = cfg.arm64 ? "arm64" : "amd64";
   const name = `bun-webkit-${os}-${arch}${prebuiltSuffix(cfg)}`;
-  return `https://github.com/oven-sh/WebKit/releases/download/${webkitReleaseTag(cfg.webkitVersion)}/${name}.tar.gz`;
+  const base = cfg.webkitMirror ?? "https://github.com/oven-sh/WebKit/releases/download";
+  return `${base}/${webkitReleaseTag(cfg.webkitVersion)}/${name}.tar.gz`;
 }
 
 /** Name prefix shared by every prebuilt extraction dir of one WebKit version, across targets and variants. */

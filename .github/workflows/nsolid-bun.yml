@@ -54,7 +54,10 @@ jobs:
         run: bun packages/nsolid-protocol/generate.ts --check
 
       - name: Build
-        run: bun run build:release
+        env:
+          # Set once nsolid-webkit-mirror.yml has copied the pinned WebKit release.
+          NSOLID_WEBKIT_MIRROR: ${{ vars.NSOLID_WEBKIT_MIRROR }}
+        run: bun run build:release ${NSOLID_WEBKIT_MIRROR:+--webkit-mirror=$NSOLID_WEBKIT_MIRROR}
 
       - name: Install test dependencies
         working-directory: test

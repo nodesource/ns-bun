@@ -240,7 +240,7 @@ describe("N|Solid agent", () => {
       saas: undefined,
     });
     expect(headers["nsolid-agent-id"]).toMatch(/^[0-9a-f]{40}$/);
-    expect(headers["nsolid-version"]).toStartWith("bun-v");
+    expect(headers["nsolid-version"]).toBe(`nsolid-bun-v${process.versions.nsolid_bun}+bun-v${Bun.version}`);
   });
 
   test.concurrent("acknowledges every command with an empty message", async () => {
@@ -1069,5 +1069,54 @@ describe("N|Solid agent", () => {
     expect(result.same).toBe(true);
     expect(result.id).toMatch(/^[0-9a-f]{40}$/);
     expect(exitCode).toBe(0);
+  });
+});
+
+describe("nsolid-bun", () => {
+  test.concurrent("reports its own version beside Bun's", async () => {
+    await using proc = Bun.spawn({ cmd: [bunExe(), "--version"], env: bunEnv, stdout: "pipe", stderr: "inherit" });
+    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+    expect(process.versions.nsolid_bun).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(stdout).toBe(`${Bun.version} (nsolid-bun ${process.versions.nsolid_bun})\n`);
+    expect(exitCode).toBe(0);
+  });
+
+  test("names itself in the User-Agent", async () => {
+    using server = Bun.serve({ port: 0, fetch: request => new Response(request.headers.get("user-agent")) });
+    const userAgent = `Bun/${Bun.version} nsolid-bun/${process.versions.nsolid_bun}`;
+    expect(await (await fetch(server.url)).text()).toBe(userAgent);
+    expect(navigator.userAgent).toBe(userAgent);
+  });
+
+  test.concurrent("does not replace itself with Bun on upgrade", async () => {
+    await using proc = Bun.spawn({ cmd: [bunExe(), "upgrade"], env: bunEnv, stdout: "pipe", stderr: "pipe" });
+    const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+    expect(stderr).toContain("nsolid-bun does not upgrade itself");
+    expect(stderr).toContain("https://github.com/nodesource/ns-bun/releases");
+    expect(exitCode).toBe(1);
+  });
+
+  test.concurrent("prints a crash's trace with no bun.report link", async () => {
+    const env: Record<string, string | undefined> = {
+      ...bunEnv,
+      BUN_FEATURE_FLAG_INTERNAL_FOR_TESTING: "1",
+      BUN_ENABLE_CRASH_REPORTING: "0",
+    };
+    delete env.BUN_CRASH_REPORT_URL;
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        join(import.meta.dir, "..", "..", "..", "cli", "run", "fixture-crash.js"),
+        "panic",
+        "--debug-crash-handler-use-trace-string",
+      ],
+      env,
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+    expect(stderr).toContain("Please include this crash trace when you report it to NodeSource:");
+    expect(stderr).not.toContain("bun.report");
+    expect(exitCode).not.toBe(0);
   });
 });

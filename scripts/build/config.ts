@@ -443,6 +443,12 @@ export interface Config {
   nodejsV8Version: string;
   /** WebKit commit. Default in versions.ts; override to test a WebKit branch. */
   webkitVersion: string;
+  /**
+   * Where the WebKit prebuilts are downloaded from instead of oven-sh/WebKit's
+   * releases: a base URL that `<release tag>/<tarball>` is appended to. The
+   * tarballs are still checked against deps/webkit.sha256.
+   */
+  webkitMirror: string | undefined;
 }
 
 /**
@@ -534,6 +540,7 @@ export interface PartialConfig {
   nodejsAbiVersion?: string;
   nodejsV8Version?: string;
   webkitVersion?: string;
+  webkitMirror?: string;
 }
 
 /** The JavaScript tools: all that the code generators run with. */
@@ -1605,6 +1612,7 @@ export function resolveConfig(partial: PartialConfig, toolchain: Toolchain): Con
     nodejsAbiVersion,
     canaryRevision,
     webkitVersion,
+    webkitMirror: partial.webkitMirror?.replace(/\/+$/, "") || undefined,
   };
 }
 

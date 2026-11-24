@@ -5,7 +5,7 @@
 
 const os = require("node:os");
 
-const SCOPE = { name: "nsolid", version: `bun-v${Bun.version}` };
+const SCOPE = { name: "nsolid", version: `nsolid-bun-v${process.versions.nsolid_bun}+bun-v${Bun.version}` };
 const CUMULATIVE = 2;
 // OpenTelemetry's names, where they differ from Node's.
 const HOST_ARCH: Record<string, string> = { x64: "amd64", ia32: "x86", arm: "arm32" };

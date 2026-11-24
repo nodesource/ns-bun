@@ -490,6 +490,7 @@ const configFlags: { [K in keyof Required<PartialConfig>]: ConfigFlagKind<NonNul
   nodejsAbiVersion: "string",
   nodejsV8Version: "string",
   webkitVersion: "string",
+  webkitMirror: "string",
 };
 
 /** `ninja -d list` */
