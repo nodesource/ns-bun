@@ -83,3 +83,89 @@ jobs:
           name: nsolid-bun-linux-x64
           path: dist/nsolid-bun-linux-x64.tar.gz
           if-no-files-found: error
+
+  # Bun's own tests of what the agent hooks into, run by Bun's test runner
+  # (its retries, test/expectations.txt and test/flaky-tests.txt) against the
+  # build above: with the agent off, as every process that doesn't ask for it
+  # runs; and with it on and tracing, against a stub gateway.
+  bun-tests:
+    name: Bun tests, ${{ matrix.suite.name }}, agent ${{ matrix.agent }}
+    needs: linux-x64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: ["off", "on"]
+        suite:
+          - name: node:http
+            include: js/node/http/,parallel/test-http-
+          - name: node:net, dgram and dns
+            include: js/node/net/,js/node/dgram/,js/node/dns/,parallel/test-net-,parallel/test-dgram-,parallel/test-dns-
+          - name: node:fs
+            include: js/node/fs/,parallel/test-fs-
+          - name: Bun.serve and sockets
+            include: js/bun/http/,js/bun/net/,js/bun/udp/,js/bun/dns/
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: nsolid-bun-linux-x64
+          path: dist
+
+      - name: Unpack
+        run: |
+          tar -xzf dist/nsolid-bun-linux-x64.tar.gz -C dist
+          mkdir -p build/release
+          mv dist/nsolid-bun-linux-x64/nsolid-bun build/release/bun
+
+      - name: Start a stub gateway
+        if: matrix.agent == 'on'
+        run: |
+          build/release/bun scripts/nsolid/stub-gateway.ts 47051 < /dev/null > stub-gateway.log 2>&1 &
+          timeout 30 sh -c 'until [ -s stub-gateway.log ]; do sleep 0.2; done'
+          cat stub-gateway.log
+          {
+            echo NSOLID_GRPC=127.0.0.1:47051
+            echo NSOLID_GRPC_INSECURE=1
+            echo NSOLID_APP=bun-tests
+            echo NSOLID_TRACING_ENABLED=1
+          } >> "$GITHUB_ENV"
+
+      - name: Run
+        run: |
+          echo core | sudo tee /proc/sys/kernel/core_pattern
+          ulimit -c 0
+          node scripts/runner.node.ts --exec-path build/release/bun --vendor=false --include "${{ matrix.suite.include }}"
+
+  # What the agent costs the build above, against the overhead budget, in the
+  # run's summary. Shared runners are noisy, so this reports and never fails
+  # on the numbers.
+  overhead:
+    name: Agent overhead
+    needs: linux-x64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: nsolid-bun-linux-x64
+          path: dist
+
+      - name: Measure
+        run: |
+          tar -xzf dist/nsolid-bun-linux-x64.tar.gz -C dist
+          bin=dist/nsolid-bun-linux-x64/nsolid-bun
+          $bin scripts/nsolid/measure-overhead.ts $bin --json overhead.json --markdown "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nsolid-bun-overhead
+          path: overhead.json
