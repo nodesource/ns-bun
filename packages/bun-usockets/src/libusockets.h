@@ -625,6 +625,8 @@ struct us_loop_timing {
     uint64_t events;
     /* Events returned by polls that did not wait, which were ready before the poll. */
     uint64_t events_waiting;
+    /* The loop's `active` (what Bun holds it open with) at the start of the last outermost tick. */
+    uint32_t active;
 };
 struct us_loop_timing *us_loop_timing_of_current_thread(void);
 uint64_t us_loop_timing_now_ns(void);

@@ -38,6 +38,7 @@ unsafe extern "C" {
     safe fn Bun__NSolid__registerThread(global: &JSGlobalObject, context_id: u32);
     safe fn Bun__NSolid__unregisterThread(context_id: u32);
     safe fn Bun__NSolid__noteRequestedCollection(full: bool);
+    safe fn Bun__NSolid__countHandle(counter: u8);
     safe fn Bun__NSolid__recordFatalError(global: &JSGlobalObject, error: JSValue);
     #[cfg(unix)]
     fn Bun__NSolid__recordCrash(
@@ -257,6 +258,34 @@ mod signals {
             let _ = bun_sys::write(to_handler, &byte);
         }
     }
+}
+
+/// What N|Solid counts as a thread opens and closes it (its `nsolid_counts`).
+/// A unix socket or a named pipe is a pipe; a listener is a server.
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub enum Handle {
+    TcpServer,
+    TcpSocket,
+    UdpSocket,
+    PipeServer,
+    PipeSocket,
+    File,
+}
+
+/// Counts a handle the calling thread opened or closed, while the agent runs.
+#[inline]
+pub fn count_handle(handle: Handle, opened: bool) {
+    if STARTED.load(Ordering::Relaxed) {
+        Bun__NSolid__countHandle(handle as u8 * 2 + u8::from(!opened));
+    }
+}
+
+/// N|Solid's active requests on the calling thread: the work it sent off the
+/// thread (fs, dns, crypto, zlib, fetch) that has not finished.
+#[unsafe(no_mangle)]
+extern "C" fn Bun__NSolid__requestsInFlight() -> u32 {
+    VirtualMachine::get_or_null().map_or(0, |vm| vm.handle_ref().tickets_outstanding())
 }
 
 /// Lists a JavaScript thread for the agent's per-thread metrics, from that

@@ -258,6 +258,7 @@ impl<const SSL: bool> VHandler for BunSocket<SSL> {
 
     fn on_open_no_ext(s: *mut us_socket_t, _is_client: bool, _ip: &[u8]) {
         if let Some(ns) = NativeRef::<SSL>::of(s).cloned() {
+            ns.count_opened(ns.dialed_handle());
             fold(ns.on_open(wrap(s)));
         }
     }
@@ -274,6 +275,7 @@ impl<const SSL: bool> VHandler for BunSocket<SSL> {
     fn on_close_no_ext(s: *mut us_socket_t, code: i32, reason: Option<*mut c_void>) {
         // SAFETY: a losing candidate is closed without a dispatch.
         if let Some(ns) = unsafe { NativeRef::<SSL>::of(s).take() } {
+            ns.count_closed();
             fold(ns.on_close(wrap(s), code, reason));
         }
     }
@@ -342,7 +344,9 @@ impl<const SSL: bool> VHandler for BunListener<SSL> {
         // SAFETY: `owner::<Listener>()` returns the back-pointer stashed by
         // `Listener::listen`; the listener strictly outlives every accepted
         // socket and is read-only here.
-        let ns = api::Listener::on_create::<SSL>(unsafe { &*listener }, s);
+        let listener = unsafe { &*listener };
+        let ns = api::Listener::on_create::<SSL>(listener, s);
+        ns.count_opened(listener.socket_handle());
         fold(ns.on_open(wrap::<SSL>(s)));
     }
     // Accepted sockets reach the remaining events as `.bun_socket_*` once

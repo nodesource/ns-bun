@@ -51,12 +51,20 @@ async function fakeGateway() {
 // what the agent sends back on each RPC.
 const protoDir = join(import.meta.dir, "..", "..", "..", "..", "packages", "nsolid-protocol", "proto");
 const { grpcagent, opentelemetry } = grpc.loadPackageDefinition(
-  protoLoader.loadSync(["nsolid_service.proto", "opentelemetry/proto/collector/metrics/v1/metrics_service.proto"], {
-    includeDirs: [protoDir],
-    keepCase: true,
-    longs: String,
-    enums: Number,
-  }),
+  protoLoader.loadSync(
+    [
+      "nsolid_service.proto",
+      "opentelemetry/proto/collector/metrics/v1/metrics_service.proto",
+      "opentelemetry/proto/collector/trace/v1/trace_service.proto",
+      "opentelemetry/proto/collector/logs/v1/logs_service.proto",
+    ],
+    {
+      includeDirs: [protoDir],
+      keepCase: true,
+      longs: String,
+      enums: Number,
+    },
+  ),
 ) as any;
 
 async function grpcGateway(commands: object[]) {
@@ -74,6 +82,14 @@ async function grpcGateway(commands: object[]) {
     record(rpc, call.request);
     callback(null, {});
   };
+  const clientStream = (rpc: string) => (call: any, callback: any) => {
+    const messages: any[] = [];
+    call.on("data", (m: any) => messages.push(m));
+    call.on("end", () => {
+      record(rpc, messages);
+      callback(null, {});
+    });
+  };
 
   const server = new grpc.Server();
   server.addService(grpcagent.NSolidService.service, {
@@ -84,15 +100,9 @@ async function grpcGateway(commands: object[]) {
       call.on("error", () => {});
       for (const command of commands) call.write(command);
     },
-    ExportAsset(call: any, callback: any) {
-      const messages: any[] = [];
-      call.on("data", (m: any) => messages.push(m));
-      call.on("end", () => {
-        record("ExportAsset", messages);
-        callback(null, {});
-      });
-    },
+    ExportAsset: clientStream("ExportAsset"),
     ExportBlockedLoop: unary("ExportBlockedLoop"),
+    ExportContinuousProfile: clientStream("ExportContinuousProfile"),
     ExportExit: unary("ExportExit"),
     ExportInfo: unary("ExportInfo"),
     ExportMetrics: unary("ExportMetrics"),
@@ -105,6 +115,8 @@ async function grpcGateway(commands: object[]) {
   server.addService(opentelemetry.proto.collector.metrics.v1.MetricsService.service, {
     Export: unary("MetricsExport"),
   });
+  server.addService(opentelemetry.proto.collector.trace.v1.TraceService.service, { Export: unary("TraceExport") });
+  server.addService(opentelemetry.proto.collector.logs.v1.LogsService.service, { Export: unary("LogsExport") });
   const port = await new Promise<number>((resolve, reject) =>
     server.bindAsync("127.0.0.1:0", grpc.ServerCredentials.createInsecure(), (err, port) =>
       err ? reject(err) : resolve(port),
@@ -339,7 +351,12 @@ describe("N|Solid agent", () => {
       },
       { requestId: "r-packages", id: "x", command: "packages" },
       { requestId: "r-metrics", id: "x", command: "metrics" },
-      { requestId: "r-source", id: "x", command: "source_code", args: { source_code: { thread_id: 0, script_id: 1 } } },
+      {
+        requestId: "r-source",
+        id: "x",
+        command: "source_code",
+        args: { source_code: { thread_id: 0, script_id: 1, path: "/nowhere.js" } },
+      },
     ]);
     using dir = tempDir("nsolid-agent", {
       "package.json": JSON.stringify({ name: "from-package-json", version: "1.2.3" }),
@@ -386,8 +403,20 @@ describe("N|Solid agent", () => {
     expect({ runtime, capabilities }).toEqual({
       runtime: { name: "bun", version: Bun.version, engine: "jsc", agent_version: versions.nsolid_bun },
       capabilities: {
-        commands: ["info", "metrics", "packages", "profile", "reconfigure", "snapshot", "startup_times"],
-        settings: ["assetsEnabled", "blockedLoopThreshold", "interval", "pauseMetrics", "redactSnapshots", "tags"],
+        commands: ["info", "metrics", "packages", "profile", "reconfigure", "snapshot", "source_code", "startup_times"],
+        settings: [
+          "assetsEnabled",
+          "blockedLoopThreshold",
+          "contCpuProfile",
+          "interval",
+          "pauseMetrics",
+          "redactSnapshots",
+          "sourceCodeEnabled",
+          "tags",
+          "traceSampleRate",
+          "tracingEnabled",
+          "tracingModulesBlacklist",
+        ],
       },
     });
     expect(body).toEqual({
@@ -451,7 +480,10 @@ describe("N|Solid agent", () => {
       gateway.next("ExportSourceCode"),
     ]);
     expect(asset.map((m: any) => [m.common.requestId, m.common.error])).toEqual([["r-profile", notAvailable]]);
-    expect([source].map(m => [m.common.requestId, m.common.error])).toEqual([["r-source", notAvailable]]);
+    // Source reads were turned on by the reconfigure, and no script has that id and path.
+    expect([source].map(m => [m.common.requestId, m.common.error])).toEqual([
+      ["r-source", { code: 500, message: "Internal Runtime Error(1007)" }],
+    ]);
     expect([packages.common.requestId, packages.common.error]).toEqual(["r-packages", undefined]);
     expect({
       requestId: metrics.common.requestId,
@@ -532,6 +564,20 @@ describe("N|Solid agent", () => {
     const metrics = resourceMetrics.scope_metrics[0].metrics;
     expect(metrics.map((m: any) => m.name).sort()).toEqual(
       [
+        "activeHandles",
+        "activeRequests",
+        "tcpServerCreatedCount",
+        "tcpServerDestroyedCount",
+        "tcpSocketCreatedCount",
+        "tcpSocketDestroyedCount",
+        "udpSocketCreatedCount",
+        "udpSocketDestroyedCount",
+        "pipeServerCreatedCount",
+        "pipeServerDestroyedCount",
+        "pipeSocketCreatedCount",
+        "pipeSocketDestroyedCount",
+        "fsHandlesOpenedCount",
+        "fsHandlesClosedCount",
         "blockInputOpCount",
         "blockOutputOpCount",
         "cpuPercent",
@@ -539,6 +585,8 @@ describe("N|Solid agent", () => {
         "cpuUserPercent",
         "ctxSwitchInvoluntaryCount",
         "ctxSwitchVoluntaryCount",
+        "dns",
+        "dnsCount",
         "eventsProcessed",
         "eventsWaiting",
         "externalMem",
@@ -550,6 +598,12 @@ describe("N|Solid agent", () => {
         "gcMajorCount",
         "heapTotal",
         "heapUsed",
+        "httpClient",
+        "httpClientAbortCount",
+        "httpClientCount",
+        "httpServer",
+        "httpServerAbortCount",
+        "httpServerCount",
         "ipcReceivedCount",
         "ipcSentCount",
         "load15m",
@@ -1729,6 +1783,565 @@ describe("N|Solid agent", () => {
       [404, "Heap sampling could not be started"],
     ]);
     expect(exitCode).toBe(0);
+  });
+
+  describe("traces", () => {
+    const valueOf = (value: any): unknown =>
+      value.string_value ??
+      (value.int_value !== undefined ? Number(value.int_value) : undefined) ??
+      value.bool_value ??
+      value.double_value ??
+      value.array_value?.values.map(valueOf);
+    const hex = (bytes: Uint8Array | undefined) => Buffer.from(bytes ?? []).toString("hex");
+    const spansOf = (request: any) =>
+      request.resource_spans.flatMap((resource: any) =>
+        resource.scope_spans.flatMap((scope: any) =>
+          scope.spans.map((span: any) => ({
+            traceId: hex(span.trace_id),
+            spanId: hex(span.span_id),
+            parentSpanId: hex(span.parent_span_id),
+            name: span.name,
+            kind: span.kind,
+            attributes: Object.fromEntries(span.attributes.map((a: any) => [a.key, valueOf(a.value)])),
+            durationNs: BigInt(span.end_time_unix_nano) - BigInt(span.start_time_unix_nano),
+            status: span.status ?? undefined,
+          })),
+        ),
+      );
+    // Every span exported until `found` finds what it looks for.
+    async function spansUntil<T>(gateway: { next(rpc: string): Promise<any> }, found: (spans: any[]) => T | undefined) {
+      const spans: any[] = [];
+      for (;;) {
+        const result = found(spans);
+        if (result !== undefined) return result;
+        spans.push(...spansOf(await gateway.next("TraceExport")));
+      }
+    }
+    const metricPoint = (request: any, name: string) =>
+      request.resource_metrics[0].scope_metrics[0].metrics.find((m: any) => m.name === name);
+
+    test.concurrent("of node:http, with the client's span the parent of the server's", async () => {
+      await using gateway = await grpcGateway([]);
+      const script = `
+        const http = require("node:http");
+        const server = http.createServer((req, res) => res.end("ok"));
+        server.listen(0, "127.0.0.1", () => {
+          console.log(server.address().port);
+          setInterval(() => {
+            http.get({ host: "127.0.0.1", port: server.address().port, path: "/work?x=1" }, res => res.resume());
+          }, 50);
+        });`;
+      await using proc = spawnAgent(gateway, script, { NSOLID_TRACING_ENABLED: "1", NSOLID_INTERVAL: "100" });
+      const port = Number(await lineReader(proc.stdout)());
+      const [client, server] = await spansUntil(gateway, spans => {
+        for (const server of spans.filter(span => span.attributes["nsolid.span_type"] === 8)) {
+          const client = spans.find(span => span.spanId === server.parentSpanId);
+          if (client) return [client, server];
+        }
+      });
+      const url = `http://127.0.0.1:${port}/work?x=1`;
+      expect({ ...client, spanId: undefined, durationNs: undefined }).toEqual({
+        traceId: server.traceId,
+        spanId: undefined,
+        parentSpanId: "",
+        name: "HTTP GET",
+        kind: 3,
+        attributes: {
+          "http.method": "GET",
+          "http.url": url,
+          "network.protocol.version": "1.1",
+          "http.status_code": 200,
+          "http.status_text": "OK",
+          "thread.id": 0,
+          "nsolid.span_type": 4,
+        },
+        durationNs: undefined,
+        status: undefined,
+      });
+      expect({ ...server, spanId: undefined, durationNs: undefined }).toEqual({
+        traceId: client.traceId,
+        spanId: undefined,
+        parentSpanId: client.spanId,
+        name: "HTTP GET",
+        kind: 2,
+        attributes: {
+          "http.method": "GET",
+          "http.url": url,
+          "network.protocol.version": "1.1",
+          "http.status_code": 200,
+          "http.status_text": "OK",
+          "thread.id": 0,
+          "nsolid.span_type": 8,
+        },
+        durationNs: undefined,
+        status: undefined,
+      });
+      expect(client.durationNs).toBeGreaterThan(0n);
+      expect(server.durationNs).toBeGreaterThan(0n);
+
+      // The same requests, in the thread's metrics.
+      for (;;) {
+        const request = await gateway.next("MetricsExport");
+        const count = (name: string) => Number(metricPoint(request, name).sum.data_points[0].as_int);
+        if (count("httpServerCount") === 0 || count("httpClientCount") === 0) continue;
+        const summary = metricPoint(request, "httpServer");
+        expect({
+          unit: summary.unit,
+          quantiles: summary.summary.data_points[0].quantile_values.map((q: any) => q.quantile),
+        }).toEqual({
+          unit: "ms",
+          quantiles: [0.5, 0.99],
+        });
+        break;
+      }
+    });
+
+    test.concurrent("of Bun.serve and fetch, continuing the trace a request came with", async () => {
+      await using gateway = await grpcGateway([]);
+      const script = `
+        const nsolid = require("nsolid");
+        const server = Bun.serve({
+          port: 0,
+          async fetch(req) {
+            if (new URL(req.url).pathname === "/inner") return new Response("inner", { status: 201 });
+            nsolid.logger.info("outer");
+            const res = await fetch("http://127.0.0.1:" + server.port + "/inner?q=1");
+            return new Response(await res.text());
+          },
+        });
+        console.log(server.port);
+        for await (const _ of console) {}`;
+      await using proc = spawnAgent(gateway, script, { NSOLID_TRACING_ENABLED: "1" });
+      const port = Number(await lineReader(proc.stdout)());
+      const traceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+      const callerSpanId = "00f067aa0ba902b7";
+      let poking = true;
+      (async () => {
+        while (poking) {
+          await fetch(`http://127.0.0.1:${port}/outer`, {
+            headers: { traceparent: `00-${traceId}-${callerSpanId}-01` },
+          }).then(res => res.text());
+        }
+      })();
+      try {
+        const [outer, client, inner] = await spansUntil(gateway, spans => {
+          for (const outer of spans.filter(span => span.parentSpanId === callerSpanId)) {
+            const client = spans.find(span => span.parentSpanId === outer.spanId);
+            const inner = client && spans.find(span => span.parentSpanId === client.spanId);
+            if (inner) return [outer, client, inner];
+          }
+        });
+        const summary = ({ traceId, name, kind, attributes }: any) => ({ traceId, name, kind, attributes });
+        expect([outer, client, inner].map(summary)).toEqual([
+          {
+            traceId,
+            name: "HTTP GET",
+            kind: 2,
+            attributes: {
+              "http.method": "GET",
+              "http.url": `http://127.0.0.1:${port}/outer`,
+              "network.protocol.version": "1.1",
+              "http.status_code": 200,
+              "thread.id": 0,
+              "nsolid.span_type": 8,
+            },
+          },
+          {
+            traceId,
+            name: "HTTP GET",
+            kind: 3,
+            attributes: {
+              "http.method": "GET",
+              "http.url": `http://127.0.0.1:${port}/inner?q=1`,
+              "http.status_code": 201,
+              "thread.id": 0,
+              "nsolid.span_type": 4,
+            },
+          },
+          {
+            traceId,
+            name: "HTTP GET",
+            kind: 2,
+            attributes: {
+              "http.method": "GET",
+              "http.url": `http://127.0.0.1:${port}/inner?q=1`,
+              "network.protocol.version": "1.1",
+              "http.status_code": 201,
+              "thread.id": 0,
+              "nsolid.span_type": 8,
+            },
+          },
+        ]);
+
+        // A line logged in the handler carries the handler's span.
+        for (;;) {
+          const request = await gateway.next("LogsExport");
+          const records = request.resource_logs.flatMap((r: any) => r.scope_logs.flatMap((s: any) => s.log_records));
+          const record = records.find((r: any) => hex(r.span_id) === outer.spanId);
+          if (!record) continue;
+          expect({
+            body: record.body.string_value,
+            severity: record.severity_number,
+            text: record.severity_text,
+            traceId: hex(record.trace_id),
+            flags: record.flags,
+            sameTimes: record.time_unix_nano === record.observed_time_unix_nano,
+          }).toEqual({ body: "outer", severity: 9, text: "INFO", traceId, flags: 1, sameTimes: true });
+          expect(Math.abs(Number(BigInt(record.time_unix_nano) / 1_000_000n) - Date.now())).toBeLessThan(60_000);
+          break;
+        }
+      } finally {
+        poking = false;
+      }
+    });
+
+    test.concurrent("of node:dns, with its counts and latencies in the thread's metrics", async () => {
+      await using gateway = await grpcGateway([]);
+      const script = `setInterval(() => require("node:dns").promises.lookup("localhost").catch(() => {}), 50);`;
+      await using proc = spawnAgent(gateway, script, { NSOLID_TRACING_ENABLED: "1", NSOLID_INTERVAL: "100" });
+      const span = await spansUntil(gateway, spans => spans.find(span => span.name === "DNS lookup"));
+      const { "dns.address": address, ...attributes } = span.attributes;
+      expect({ kind: span.kind, parentSpanId: span.parentSpanId, attributes }).toEqual({
+        kind: 3,
+        parentSpanId: "",
+        attributes: { "dns.op_type": 0, "dns.hostname": "localhost", "thread.id": 0, "nsolid.span_type": 1 },
+      });
+      expect(JSON.parse(address)).toBeTypeOf("string");
+      for (;;) {
+        const request = await gateway.next("MetricsExport");
+        if (Number(metricPoint(request, "dnsCount").sum.data_points[0].as_int) > 0) break;
+      }
+    });
+
+    test.concurrent("sampled at the root with traceSampleRate, which reconfigure changes", async () => {
+      await using gateway = await grpcGateway([]);
+      const script = `
+        const http = require("node:http");
+        const server = http.createServer((req, res) => { console.log(req.headers.traceparent); res.end(); });
+        server.listen(0, "127.0.0.1", () => {
+          setInterval(() => http.get({ host: "127.0.0.1", port: server.address().port }, res => res.resume()), 50);
+        });`;
+      await using proc = spawnAgent(gateway, script, { NSOLID_TRACING_ENABLED: "1", NSOLID_TRACE_SAMPLE_RATE: "0" });
+      const nextLine = lineReader(proc.stdout);
+      // Not sampled, but still propagated, so that the services downstream don't sample it either.
+      while (!/^00-[0-9a-f]{32}-[0-9a-f]{16}-00$/.test(await nextLine()));
+      await gateway.command({
+        requestId: "r-rate",
+        id: "x",
+        command: "reconfigure",
+        args: { reconfigure: { traceSampleRate: 1 } },
+      });
+      expect((await gateway.next("ExportReconfigure")).body.traceSampleRate).toBe(1);
+      await spansUntil(gateway, spans => spans.find(span => span.attributes["nsolid.span_type"] === 8));
+    });
+
+    test.concurrent("of the OpenTelemetry API an application registers, in its own traces", async () => {
+      await using gateway = await grpcGateway([]);
+      // What the bridge uses of @opentelemetry/api: it delegates to the registered globals, as the API does.
+      const script = `
+        const nsolid = require("nsolid");
+        const KEY = Symbol.for("OpenTelemetry Context Key SPAN");
+        class Context {
+          constructor(values = new Map()) { this.values = values; }
+          getValue(key) { return this.values.get(key); }
+          setValue(key, value) { return new Context(new Map(this.values).set(key, value)); }
+          deleteValue(key) { const values = new Map(this.values); values.delete(key); return new Context(values); }
+        }
+        const ROOT_CONTEXT = new Context();
+        let manager, provider;
+        const api = {
+          ROOT_CONTEXT,
+          context: {
+            setGlobalContextManager(m) { if (manager) return false; manager = m; return true; },
+            active() { return manager ? manager.active() : ROOT_CONTEXT; },
+            with(context, fn, thisArg, ...args) { return manager.with(context, fn, thisArg, ...args); },
+            disable() { manager?.disable(); manager = undefined; },
+          },
+          trace: {
+            setGlobalTracerProvider(p) { if (provider) return false; provider = p; return true; },
+            getTracer(name, version) { return provider.getTracer(name, version); },
+            getSpanContext(context) { return context.getValue(KEY)?.spanContext(); },
+            setSpan(context, span) { return context.setValue(KEY, span); },
+            wrapSpanContext(spanContext) { return { spanContext: () => spanContext, end() {} }; },
+            disable() { provider = undefined; },
+          },
+        };
+        console.log(nsolid.otel.register(api));
+        try { nsolid.otel.register(api); } catch (error) { console.log(error.code); }
+        nsolid.otel.registerInstrumentations({
+          enable() {
+            const tracer = api.trace.getTracer("app", "1.0.0");
+            setInterval(() => {
+              const result = tracer.startActiveSpan("parent", { attributes: { a: 1, list: ["x", "y"], nested: { no: 1 } } }, parent => {
+                const child = tracer.startSpan("child", { kind: 2 });
+                child.setStatus({ code: 2, message: "bad" });
+                child.end();
+                nsolid.logger.warn({ in: "parent" });
+                parent.end();
+                return "result";
+              });
+              if (result !== "result") console.log("lost the result");
+            }, 50);
+          },
+          disable() {},
+        });
+        for await (const _ of console) {}`;
+      await using proc = spawnAgent(gateway, script, { NSOLID_TRACING_ENABLED: "1" });
+      const nextLine = lineReader(proc.stdout);
+      expect([await nextLine(), await nextLine()]).toEqual(["true", "ERR_NSOLID_OTEL_API_ALREADY_REGISTERED"]);
+      const [parent, child] = await spansUntil(gateway, spans => {
+        for (const child of spans.filter(span => span.name === "child")) {
+          const parent = spans.find(span => span.spanId === child.parentSpanId);
+          if (parent) return [parent, child];
+        }
+      });
+      const summary = ({ name, kind, parentSpanId, attributes, status }: any) => ({
+        name,
+        kind,
+        root: parentSpanId === "",
+        attributes,
+        status,
+      });
+      expect([parent, child].map(summary)).toEqual([
+        {
+          name: "parent",
+          kind: 1,
+          root: true,
+          attributes: { a: 1, list: ["x", "y"], "thread.id": 0, "nsolid.span_type": 16 },
+          status: undefined,
+        },
+        {
+          name: "child",
+          kind: 3,
+          root: false,
+          attributes: { "thread.id": 0, "nsolid.span_type": 16 },
+          status: { code: 2, message: "bad" },
+        },
+      ]);
+      expect(child.traceId).toBe(parent.traceId);
+      for (;;) {
+        const request = await gateway.next("LogsExport");
+        const records = request.resource_logs.flatMap((r: any) => r.scope_logs.flatMap((s: any) => s.log_records));
+        const record = records.find((r: any) => hex(r.trace_id) === parent.traceId);
+        if (!record) continue;
+        expect([record.body.string_value, record.severity_text, hex(record.span_id)]).toEqual([
+          '{"in":"parent"}',
+          "WARN",
+          parent.spanId,
+        ]);
+        break;
+      }
+    });
+  });
+
+  test.concurrent("counts the sockets, listeners and files a thread opens and closes", async () => {
+    await using gateway = await grpcGateway([]);
+    using dir = tempDir("nsolid-handles", {});
+    const script = `
+      const net = require("node:net");
+      const dgram = require("node:dgram");
+      const fs = require("node:fs");
+      const listening = server => new Promise(resolve => server.once("listening", resolve));
+      const connected = socket => new Promise(resolve => socket.once("connect", resolve));
+      const accepted = [];
+      const tcp = net.createServer(socket => accepted.push(socket)).listen(0, "127.0.0.1");
+      const pipe = net.createServer(socket => accepted.push(socket)).listen(${JSON.stringify(join(String(dir), "s.sock"))});
+      await Promise.all([listening(tcp), listening(pipe)]);
+      const clients = [net.connect(tcp.address().port, "127.0.0.1"), net.connect(pipe.address())];
+      await Promise.all(clients.map(connected));
+      while (accepted.length < 2) await new Promise(resolve => setImmediate(resolve));
+      const udp = dgram.createSocket("udp4");
+      await new Promise(resolve => udp.bind(0, "127.0.0.1", resolve));
+      const fd = fs.openSync(${JSON.stringify(join(String(dir), "file.txt"))}, "w");
+      console.log("open");
+      for await (const line of console) {
+        fs.closeSync(fd);
+        udp.close();
+        for (const socket of [...clients, ...accepted]) socket.destroy();
+        tcp.close();
+        pipe.close();
+        console.log("closed");
+      }`;
+    await using proc = spawnAgent(gateway, script, { NSOLID_INTERVAL: "100" });
+    const nextLine = lineReader(proc.stdout);
+    const counters = [
+      "tcpServerCreatedCount",
+      "tcpServerDestroyedCount",
+      "tcpSocketCreatedCount",
+      "tcpSocketDestroyedCount",
+      "udpSocketCreatedCount",
+      "udpSocketDestroyedCount",
+      "pipeServerCreatedCount",
+      "pipeServerDestroyedCount",
+      "pipeSocketCreatedCount",
+      "pipeSocketDestroyedCount",
+      "fsHandlesOpenedCount",
+      "fsHandlesClosedCount",
+    ];
+    const mainThread = (request: any, name: string) => {
+      const metric = request.resource_metrics[0].scope_metrics[0].metrics.find((m: any) => m.name === name);
+      const point = (metric.sum ?? metric.gauge).data_points.find((p: any) =>
+        p.attributes.some((a: any) => a.key === "thread.id" && a.value.int_value === "0"),
+      );
+      return Number(point.as_int);
+    };
+    const countsWhen = async (done: (counts: Record<string, number>) => boolean) => {
+      for (;;) {
+        const request = await gateway.next("MetricsExport");
+        const counts = Object.fromEntries([...counters, "activeHandles"].map(name => [name, mainThread(request, name)]));
+        if (done(counts)) return counts;
+      }
+    };
+    // A client, and the connection the server accepted, of each kind.
+    const opened = {
+      tcpServerCreatedCount: 1,
+      tcpSocketCreatedCount: 2,
+      udpSocketCreatedCount: 1,
+      pipeServerCreatedCount: 1,
+      pipeSocketCreatedCount: 2,
+      fsHandlesOpenedCount: 1,
+    };
+    expect(await nextLine()).toBe("open");
+    const open = await countsWhen(counts => counts.fsHandlesOpenedCount > 0 && counts.udpSocketCreatedCount > 0);
+    const { activeHandles: activeWhileOpen, ...openCounts } = open;
+    expect(openCounts).toEqual({
+      ...Object.fromEntries(counters.map(name => [name, 0])),
+      ...opened,
+    });
+    // The listeners, the sockets, the UDP socket and stdin hold the loop open.
+    expect(activeWhileOpen).toBeGreaterThanOrEqual(7);
+
+    proc.stdin.write("close\n");
+    expect(await nextLine()).toBe("closed");
+    const closed = await countsWhen(counts => counts.tcpSocketDestroyedCount === 2 && counts.fsHandlesClosedCount === 1);
+    const { activeHandles: activeAfter, ...closedCounts } = closed;
+    expect(closedCounts).toEqual({
+      tcpServerCreatedCount: 1,
+      tcpServerDestroyedCount: 1,
+      tcpSocketCreatedCount: 2,
+      tcpSocketDestroyedCount: 2,
+      udpSocketCreatedCount: 1,
+      udpSocketDestroyedCount: 1,
+      pipeServerCreatedCount: 1,
+      pipeServerDestroyedCount: 1,
+      pipeSocketCreatedCount: 2,
+      pipeSocketDestroyedCount: 2,
+      fsHandlesOpenedCount: 1,
+      fsHandlesClosedCount: 1,
+    });
+    expect(activeAfter).toBeLessThan(activeWhileOpen);
+  });
+
+  test.concurrent("answers source_code once the Console turns source reads on", async () => {
+    await using gateway = await grpcGateway([]);
+    const source = `function spin(ms) { const end = Date.now() + ms; while (Date.now() < end) {} }
+for await (const line of console) { spin(800); console.log("done"); }
+`;
+    using dir = tempDir("nsolid-source", { "app.mjs": source });
+    const file = join(realpathSync(String(dir)), "app.mjs");
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), file],
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "inherit",
+      env: {
+        ...bunEnv,
+        NSOLID_GRPC: `127.0.0.1:${gateway.port}`,
+        NSOLID_GRPC_INSECURE: "1",
+        NSOLID_BLOCKED_LOOP_THRESHOLD: "300",
+      },
+    });
+    await gateway.commandMetadata;
+    proc.stdin.write("block\n");
+    const blocked = await gateway.next("ExportBlockedLoop");
+    const frame = blocked.body.stack.find((f: any) => f.function_name === "spin");
+    expect(frame.script_name).toBe(file);
+    let requests = 0;
+    const sourceCode = async (args: object) => {
+      const requestId = `r-source-${++requests}`;
+      await gateway.command({ requestId, id: "x", command: "source_code", args: { source_code: args } });
+      const answer = await gateway.next("ExportSourceCode");
+      expect(answer.common.requestId).toBe(requestId);
+      return {
+        error: answer.common.error,
+        path: answer.path,
+        code: answer.code?.length ? Buffer.from(answer.code).toString() : undefined,
+        isEsm: answer.is_esm,
+      };
+    };
+    const script = { thread_id: 0, script_id: frame.script_id };
+    expect(await sourceCode({ ...script, path: file })).toEqual({
+      error: { code: 500, message: "Source code reads disabled(1009)" },
+      path: file,
+      code: undefined,
+      isEsm: undefined,
+    });
+    await gateway.command({
+      requestId: "r-on",
+      id: "x",
+      command: "reconfigure",
+      args: { reconfigure: { sourceCodeEnabled: true } },
+    });
+    expect((await gateway.next("ExportReconfigure")).body.sourceCodeEnabled).toBe(true);
+    // By a stack's path, and by a profile's file URL, which is echoed as it came.
+    const fileUrl = Bun.pathToFileURL(file).href;
+    expect([await sourceCode({ ...script, path: file }), await sourceCode({ ...script, path: fileUrl })]).toEqual([
+      { error: undefined, path: file, code: source, isEsm: true },
+      { error: undefined, path: fileUrl, code: source, isEsm: true },
+    ]);
+    const runtimeError = { code: 500, message: "Internal Runtime Error(1007)" };
+    expect([
+      (await sourceCode({ ...script, path: join(String(dir), "other.mjs") })).error,
+      (await sourceCode({ thread_id: 23, script_id: frame.script_id, path: file })).error,
+    ]).toEqual([runtimeError, { code: 410, message: "Thread already gone(1002)" }]);
+  });
+
+  test.concurrent("profiles every thread continuously while contCpuProfile is on", async () => {
+    await using gateway = await grpcGateway([
+      {
+        requestId: "r-profile",
+        id: "x",
+        command: "profile",
+        args: { profile: { thread_id: 0, duration: 100, cpu_profile: {} } },
+      },
+    ]);
+    const script = `function work() { let x = 0; for (let i = 0; i < 1e5; i++) x += i; return x; }
+      setInterval(work, 5);`;
+    await using proc = spawnAgent(gateway, script, {
+      NSOLID_CONT_CPU_PROFILE: "1",
+      NSOLID_CONT_CPU_PROFILE_INTERVAL: "200",
+    });
+    // Profiling continuously is a profile in progress.
+    const refused = await gateway.next("ExportAsset");
+    expect(refused.map((m: any) => m.common.error)).toEqual([
+      { code: 409, message: "Operation already in progress(1001)" },
+    ]);
+    const windows = [await gateway.next("ExportContinuousProfile"), await gateway.next("ExportContinuousProfile")];
+    for (const messages of windows) {
+      const last = messages.at(-1);
+      const requestIds = new Set(messages.map((m: any) => m.common.requestId));
+      const profile = JSON.parse(Buffer.concat(messages.slice(0, -1).map((m: any) => m.data)).toString());
+      expect({
+        command: last.common.command,
+        sameRequest: requestIds.size,
+        thread: Number(last.thread_id),
+        complete: last.complete,
+        metadata: last.metadata,
+        hasNodes: profile.nodes.length > 0,
+      }).toEqual({
+        command: "profile",
+        sameRequest: 1,
+        thread: 0,
+        complete: true,
+        metadata: {},
+        hasNodes: true,
+      });
+      expect([...requestIds][0]).toMatch(/^[0-9a-f]{40}$/);
+      expect(Number(last.duration)).toBeGreaterThan(0);
+      expect(last.end_ts).toBeGreaterThan(last.start_ts);
+      expect(Math.abs(last.start_ts - Date.now())).toBeLessThan(60_000);
+    }
+    expect(windows[1].at(-1).start_ts).toBeGreaterThanOrEqual(windows[0].at(-1).end_ts - 1);
   });
 
   test.concurrent("nsolid and bun:nsolid are the same module, with the process's id", async () => {

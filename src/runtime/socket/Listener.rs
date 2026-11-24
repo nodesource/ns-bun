@@ -11,6 +11,7 @@ use bun_io::JsKeepAlive;
 use bun_jsc::EncodedSliceJsc as _;
 use bun_jsc::bindgen::{JsHeap, JsLocal, JsPayload as _, JsScope, JsWrapper};
 use bun_jsc::bun_string_jsc;
+use bun_jsc::nsolid_agent::{self, Handle};
 use bun_jsc::strong::Optional as Strong;
 use bun_jsc::virtual_machine::VirtualMachine;
 use bun_jsc::{self as jsc, JSGlobalObject, JSValue, JsCell, JsRef, JsResult, StringJsc as _};
@@ -542,6 +543,7 @@ impl Listener {
 
         this_ref.connection.with_mut(|c| *c = connection);
         this_ref.listener.set(ListenerType::Uws(owned_socket));
+        nsolid_agent::count_handle(this_ref.server_handle(), true);
         if !default_data.is_empty() {
             this_ref
                 .strong_data
@@ -779,6 +781,7 @@ impl Listener {
 
         if matches!(listener, ListenerType::Uws(_)) {
             self.unlink_unix_socket_path();
+            nsolid_agent::count_handle(self.server_handle(), false);
         }
 
         // The listener's poll_ref tracks the listening socket only; accepted
@@ -809,6 +812,24 @@ impl Listener {
             return;
         }
         let _ = bun_sys::unlink(&bun_paths::Path::from(path));
+    }
+
+    /// What N|Solid counts this listener as, and the connections it accepts
+    /// as `socket_handle`.
+    fn server_handle(&self) -> Handle {
+        if self.get_unix().is_some() {
+            Handle::PipeServer
+        } else {
+            Handle::TcpServer
+        }
+    }
+
+    pub(crate) fn socket_handle(&self) -> Handle {
+        if self.get_unix().is_some() {
+            Handle::PipeSocket
+        } else {
+            Handle::TcpSocket
+        }
     }
 
     pub(crate) fn get_unix(&self) -> Option<&[u8]> {
@@ -1315,6 +1336,7 @@ impl Drop for Listener {
         this.abort_handle.leave();
         if matches!(this.listener.get(), ListenerType::Uws(_)) {
             this.unlink_unix_socket_path();
+            nsolid_agent::count_handle(this.server_handle(), false);
         }
         this.listener.set(ListenerType::None);
 

@@ -1767,9 +1767,11 @@ mod _async_tasks {
             self.to_js_newly_created(global)
         }
     }
+    // Only `open` answers with one: N|Solid counts it as a file handle opened, on the thread that asked.
     impl FsReturn for sys::File {
         #[inline]
         fn fs_to_js(self, global: &JSGlobalObject) -> JsResult<JSValue> {
+            bun_jsc::nsolid_agent::count_handle(bun_jsc::nsolid_agent::Handle::File, true);
             Ok(crate::node::types::FdJsc::to_js(self.into_raw(), global))
         }
     }
@@ -1997,6 +1999,9 @@ mod _async_tasks {
                 args.write_back(result.bytes_read());
             }
             let success = result.is_ok();
+            if F == NodeFSFunctionEnum::Close && success {
+                bun_jsc::nsolid_agent::count_handle(bun_jsc::nsolid_agent::Handle::File, false);
+            }
             let completion = &js.completion;
             let converted = match result {
                 Err(err) => completion.error_to_js(global_object, &err),
@@ -5098,7 +5103,7 @@ impl NodeFS {
         }
     }
 
-    pub(crate) fn close(&mut self, args: &args::Close, _: Flavor) -> Maybe<ret::Close> {
+    pub(crate) fn close(&mut self, args: &args::Close, flavor: Flavor) -> Maybe<ret::Close> {
         // Explicit `fs.close`/`fs.closeSync` must close the descriptor the user
         // asked for, including stdio (0/1/2), and surface EBADF like Node does.
         // The stdio guard only applies to Bun's own internal closes.
@@ -5107,6 +5112,10 @@ impl NodeFS {
         if let Some(err) = args.fd.close_allowing_standard_io(None) {
             Err(err)
         } else {
+            // On the JS thread; an async close is counted in `then`.
+            if flavor == Flavor::Sync {
+                bun_jsc::nsolid_agent::count_handle(bun_jsc::nsolid_agent::Handle::File, false);
+            }
             Ok(())
         }
     }

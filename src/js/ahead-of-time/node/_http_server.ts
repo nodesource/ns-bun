@@ -6,6 +6,7 @@
 const EventEmitter = require("node:events");
 const { Stream } = require("node:stream");
 const { Stream: StreamOfLibrary } = require("internal/streams/legacy");
+const nsolidHooks = require("internal/nsolid/hooks");
 const StreamPrototype = Stream.prototype;
 // A name read from `plainStream` is looked up from Stream.prototype on. No constructor runs: the other text makes no stream here.
 function PlainStream() {}
@@ -1597,6 +1598,8 @@ Server.prototype[kRealListen] = function (
         http_res.writeHead(400, { Connection: "close" });
         http_res.end();
       } else {
+        // The N|Solid agent's span of the request is the active one while the listeners run.
+        const nsolidScope = nsolidHooks.httpServerRequest?.(http_req, http_res);
         // Native code ends the response of a dispatch that throws. What the listener has written goes out first.
         try {
           if (isHttp11 && (dispatchBits & DispatchBits.has_expect) !== 0) {
@@ -1622,6 +1625,8 @@ Server.prototype[kRealListen] = function (
         } catch (error) {
           sendWhatIsHeld(http_res);
           throw error;
+        } finally {
+          nsolidScope?.[Symbol.dispose]();
         }
       }
 
@@ -1841,6 +1846,7 @@ function onNodeHTTPRequest(
   if (asksRequest) isOfHttp11(req);
   void server.requireHostHeader;
 
+  const nsolidScope = nsolidHooks.httpServerRequest?.(req, res);
   try {
     const listener = server.$requestListener;
     // Read once: an accessor may give another function at the next read.
@@ -1853,6 +1859,8 @@ function onNodeHTTPRequest(
   } catch (error) {
     if ((exchange.flags & ExchangeFlags.holds_chunk) !== 0) sendHeldChunk(res, exchange);
     throw error;
+  } finally {
+    nsolidScope?.[Symbol.dispose]();
   }
 
   if (!hasBody) req.complete = true;

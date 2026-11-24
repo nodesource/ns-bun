@@ -499,6 +499,46 @@ impl<const SSL: bool> NewSocket<SSL> {
         self.flags.set(v);
     }
 
+    /// The socket's connection opened (dialed, accepted or adopted from an
+    /// fd), for N|Solid's socket counters.
+    pub(crate) fn count_opened(&self, handle: bun_jsc::nsolid_agent::Handle) {
+        if self
+            .flags
+            .get()
+            .intersects(Flags::COUNTED_TCP | Flags::COUNTED_PIPE)
+        {
+            return;
+        }
+        let counted = match handle {
+            bun_jsc::nsolid_agent::Handle::PipeSocket => Flags::COUNTED_PIPE,
+            _ => Flags::COUNTED_TCP,
+        };
+        self.update_flags(|f| f.insert(counted));
+        bun_jsc::nsolid_agent::count_handle(handle, true);
+    }
+
+    /// The connection `count_opened` counted is gone.
+    pub(crate) fn count_closed(&self) {
+        let flags = self.flags.get();
+        let handle = if flags.contains(Flags::COUNTED_TCP) {
+            bun_jsc::nsolid_agent::Handle::TcpSocket
+        } else if flags.contains(Flags::COUNTED_PIPE) {
+            bun_jsc::nsolid_agent::Handle::PipeSocket
+        } else {
+            return;
+        };
+        self.update_flags(|f| f.remove(Flags::COUNTED_TCP | Flags::COUNTED_PIPE));
+        bun_jsc::nsolid_agent::count_handle(handle, false);
+    }
+
+    /// What N|Solid counts a connection this socket dialed as.
+    pub(crate) fn dialed_handle(&self) -> bun_jsc::nsolid_agent::Handle {
+        match self.connection.get() {
+            Some(super::listener::UnixOrHost::Unix(_)) => bun_jsc::nsolid_agent::Handle::PipeSocket,
+            _ => bun_jsc::nsolid_agent::Handle::TcpSocket,
+        }
+    }
+
     // ── codegen accessors ──
     // These hand-roll the `if (ssl) js_TLSSocket else js_TCPSocket`
     // split and route through the codegen'd safe wrappers.
@@ -689,6 +729,7 @@ impl<const SSL: bool> NewSocket<SSL> {
                 *NativeRef::of(s) = NativeRef::new(self.clone());
                 let sock = SocketHandler::<SSL>::from(s);
                 self.socket.set(sock);
+                self.count_opened(bun_jsc::nsolid_agent::Handle::TcpSocket);
                 self.clone().on_open(sock)?;
             }
             None => unreachable!("do_connect requires this.connection to be set"),
@@ -1265,6 +1306,8 @@ impl<const SSL: bool> NewSocket<SSL> {
         };
         // SAFETY: the slot of our own socket, which is never a losing candidate.
         let _native_ref = unsafe { slot.take() };
+        // Its close finds no socket in the slot to count it.
+        self.count_closed();
         self.socket.set(SocketHandler::<SSL>::DETACHED);
         self.buffered_data_for_node_net
             .with_mut(|b| b.clear_and_free());
@@ -3398,6 +3441,10 @@ impl<const SSL: bool> NewSocket<SSL> {
 
         // Only NOW is it safe for dispatch to fire: ext + kind point at `tls`.
         *NativeRef::of(new_raw.as_ptr()) = NativeRef::new(tls.clone());
+        // The connection's close now reaches `tls`, which counts it.
+        let counted = self.flags.get() & (Flags::COUNTED_TCP | Flags::COUNTED_PIPE);
+        self.update_flags(|f| f.remove(counted));
+        tls.update_flags(|f| f.insert(counted));
         tls.socket
             .set(SocketHandler::<true>::from(new_raw.as_ptr()));
 
@@ -3604,10 +3651,15 @@ bitflags::bitflags! {
     #[derive(Clone, Copy, Default, PartialEq, Eq)]
     pub struct Flags: u16 {
         const IS_ACTIVE            = 1 << 0;
+        /// Its connection opened, and N|Solid's agent counted it: as a TCP
+        /// socket, or (`COUNTED_PIPE`) as a unix one. Cleared when it is
+        /// counted closed.
+        const COUNTED_TCP          = 1 << 1;
         const AUTHORIZED           = 1 << 2;
         const HANDSHAKE_COMPLETE   = 1 << 3;
         const EMPTY_PACKET_PENDING = 1 << 4;
         const END_AFTER_FLUSH      = 1 << 5;
+        const COUNTED_PIPE         = 1 << 6;
         const IS_PAUSED            = 1 << 7;
         const ALLOW_HALF_OPEN      = 1 << 8;
         /// Set on the `raw` half of an `upgradeTLS` pair. Writes route through

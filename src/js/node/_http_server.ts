@@ -31,6 +31,7 @@ const {
 const kServerResponseStatistics = Symbol("ServerResponseStatistics");
 
 const { isPrimary } = require("internal/cluster/isPrimary");
+const nsolidHooks = require("internal/nsolid/hooks");
 const { addServerAbortSignalOption } = require("internal/net/server_abort_signal");
 const {
   kInternalSocketData,
@@ -1127,25 +1128,31 @@ Server.prototype[kRealListen] = function (tls, port, host, socketPath, reusePort
           http_res.writeHead(400, { Connection: "close" });
           http_res.end();
         } else {
-          if (isHttp11 && (dispatchBits & DISPATCH_HAS_EXPECT) !== 0) {
-            // Case-insensitive, token-boundary match like Node's
-            // parserOnIncoming (RFC 7231 5.1.1: expectation values compare
-            // case-insensitively); computed natively into the bitfield.
-            if ((dispatchBits & DISPATCH_EXPECT_CONTINUE) !== 0) {
-              if (server.listenerCount("checkContinue") > 0) {
-                server.emit("checkContinue", http_req, http_res);
+          // The N|Solid agent's span of the request is the active one while the listeners run.
+          const nsolidScope = nsolidHooks.httpServerRequest?.(http_req, http_res);
+          try {
+            if (isHttp11 && (dispatchBits & DISPATCH_HAS_EXPECT) !== 0) {
+              // Case-insensitive, token-boundary match like Node's
+              // parserOnIncoming (RFC 7231 5.1.1: expectation values compare
+              // case-insensitively); computed natively into the bitfield.
+              if ((dispatchBits & DISPATCH_EXPECT_CONTINUE) !== 0) {
+                if (server.listenerCount("checkContinue") > 0) {
+                  server.emit("checkContinue", http_req, http_res);
+                } else {
+                  http_res.writeContinue();
+                  server.emit("request", http_req, http_res);
+                }
+              } else if (server.listenerCount("checkExpectation") > 0) {
+                server.emit("checkExpectation", http_req, http_res);
               } else {
-                http_res.writeContinue();
-                server.emit("request", http_req, http_res);
+                http_res.writeHead(417);
+                http_res.end();
               }
-            } else if (server.listenerCount("checkExpectation") > 0) {
-              server.emit("checkExpectation", http_req, http_res);
             } else {
-              http_res.writeHead(417);
-              http_res.end();
+              server.emit("request", http_req, http_res);
             }
-          } else {
-            server.emit("request", http_req, http_res);
+          } finally {
+            nsolidScope?.[Symbol.dispose]();
           }
         }
 

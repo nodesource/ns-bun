@@ -88,11 +88,37 @@ function loopAndGcMetrics(stats: Record<string, number>): Record<string, number>
     // it left the poll. Otherwise the moving average of iteration times.
     loopEstimatedLag: exit > 0 && previous.time > exit ? (now - exit) / 1e6 : stats.rollingEstimatedLag,
     loopIdlePercent: (1 - utilization) * 100,
+    dnsCount: stats.dnsCount,
+    httpClientAbortCount: stats.httpClientAbortCount,
+    httpClientCount: stats.httpClientCount,
+    httpServerAbortCount: stats.httpServerAbortCount,
+    httpServerCount: stats.httpServerCount,
+    dnsMedian: stats.dnsMedian,
+    dns99Ptile: stats.dns99Ptile,
+    httpClientMedian: stats.httpClientMedian,
+    httpClient99Ptile: stats.httpClient99Ptile,
+    httpServerMedian: stats.httpServerMedian,
+    httpServer99Ptile: stats.httpServer99Ptile,
+    activeHandles: stats.activeHandles,
+    activeRequests: stats.activeRequests,
+    tcpServerCreatedCount: stats.tcpServerCreatedCount,
+    tcpServerDestroyedCount: stats.tcpServerDestroyedCount,
+    tcpSocketCreatedCount: stats.tcpSocketCreatedCount,
+    tcpSocketDestroyedCount: stats.tcpSocketDestroyedCount,
+    udpSocketCreatedCount: stats.udpSocketCreatedCount,
+    udpSocketDestroyedCount: stats.udpSocketDestroyedCount,
+    pipeServerCreatedCount: stats.pipeServerCreatedCount,
+    pipeServerDestroyedCount: stats.pipeServerDestroyedCount,
+    pipeSocketCreatedCount: stats.pipeSocketCreatedCount,
+    pipeSocketDestroyedCount: stats.pipeSocketDestroyedCount,
+    fsHandlesOpenedCount: stats.fsHandlesOpenedCount,
+    fsHandlesClosedCount: stats.fsHandlesClosedCount,
   };
 }
 
-// Every running JavaScript thread's heap, loop and GC figures. A thread that
-// ended is left out; one that did not answer in time has no heap figures.
+// Every running JavaScript thread's heap, loop, GC, HTTP and DNS figures. A
+// thread that ended is left out; one that did not answer in time has no heap
+// figures. The HTTP and DNS latencies are those since the last call.
 async function threadMetrics(): Promise<ThreadMetrics[]> {
   const threads = nsolidThreads() as { contextId: number; threadId: number; name: string }[];
   // Read before waiting on the threads' heaps, so that a thread busy with a

@@ -125,6 +125,37 @@ declare module "bun:nsolid" {
 
     /** Called on the next tick, with an error if the call failed. */
     type AssetCallback = (error?: AssetError) => void;
+
+    /**
+     * Lines for the N|Solid Console's logs. Each is sent with the span active
+     * where it is written, if any; a value that is not a string is sent as
+     * JSON. Lines written while no agent is connected are dropped.
+     */
+    interface Logger {
+      debug(message: unknown): void;
+      info(message: unknown): void;
+      warn(message: unknown): void;
+      error(message: unknown): void;
+      fatal(message: unknown): void;
+    }
+
+    interface OpenTelemetry {
+      /**
+       * Hands N|Solid an `@opentelemetry/api` module. While tracing is on, the
+       * API's global context manager and tracer provider are N|Solid's, so
+       * the spans the application starts are exported with N|Solid's HTTP and
+       * DNS spans, in the same traces. Returns false when another
+       * OpenTelemetry SDK already holds the API's globals. Throws
+       * `ERR_NSOLID_OTEL_API_ALREADY_REGISTERED` if called twice.
+       */
+      register(api: object): boolean;
+      /**
+       * Enables the given OpenTelemetry instrumentations while tracing is on,
+       * and disables them while it is off. Instrumentations that patch ES
+       * modules through loader hooks have none to use in Bun.
+       */
+      registerInstrumentations(instrumentations: object | object[]): void;
+    }
   }
 
   interface NSolid {
@@ -180,6 +211,8 @@ declare module "bun:nsolid" {
     enableAssets(): void;
     /** Turns off profiles and snapshots, from the Console and from code. */
     disableAssets(): void;
+    readonly logger: nsolid.Logger;
+    readonly otel: nsolid.OpenTelemetry;
   }
 
   const nsolid: NSolid;

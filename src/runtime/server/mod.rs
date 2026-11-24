@@ -334,7 +334,9 @@ impl<const SSL: bool, const DEBUG: bool> Drop for NewServer<SSL, DEBUG> {
         self.notify_inspector_server_stopped();
         self.abort_handle.leave();
 
-        self.listener.set(None);
+        if self.listener.take().is_some() {
+            bun_jsc::nsolid_agent::count_handle(self.nsolid_handle(true), false);
+        }
         self.h3_app.set(None);
         if let Some(h2_app) = self.h2_app.take() {
             // A drain may still be queued for it.
@@ -492,6 +494,19 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
     /// `HttpContext::onClose` / `HttpResponse::upgrade()` — see
     /// `AsyncSocketData::filteredAccept`. Feeds [`Self::active_connection_count`].
     /// `-3` / `+3`: a node:http tunnel becomes idle / has bytes to send again. `-4`: it closes idle.
+    /// What N|Solid counts the server's listener (`listener`) or its
+    /// connections as. A connection that upgrades to a WebSocket leaves the
+    /// count when it upgrades.
+    fn nsolid_handle(&self, listener: bool) -> bun_jsc::nsolid_agent::Handle {
+        use bun_jsc::nsolid_agent::Handle;
+        match (&self.config.get().address, listener) {
+            (server_config::Address::Unix(_), true) => Handle::PipeServer,
+            (server_config::Address::Unix(_), false) => Handle::PipeSocket,
+            (_, true) => Handle::TcpServer,
+            (_, false) => Handle::TcpSocket,
+        }
+    }
+
     extern "C" fn on_connection_filter(
         _socket: *mut uws_sys::us_socket_t,
         opened: i32,
@@ -500,6 +515,12 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
         // SAFETY: `user_data` is the `*mut Self` registered in `listen()`; the server outlives every socket in its app.
         let this = unsafe { &*user_data.cast::<Self>() };
         // Count from accept (2 / -2), not from open (1 / -1): a TLS socket still handshaking will dispatch once that completes.
+        match opened {
+            2 | -2 | -4 => {
+                bun_jsc::nsolid_agent::count_handle(this.nsolid_handle(false), opened == 2)
+            }
+            _ => {}
+        }
         match opened {
             2 => {
                 this.note_connection_opened();
@@ -1562,7 +1583,9 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
         }
 
         let already_terminated = self.flags.get().contains(ServerFlags::TERMINATED);
-        let Some(listener) = self.listener.take() else {
+        let Some(listener) = self.listener.take().inspect(|_| {
+            bun_jsc::nsolid_agent::count_handle(self.nsolid_handle(true), false);
+        }) else {
             if Self::HAS_H3 && self.h3_app().is_some() {
                 self.unref();
                 self.notify_inspector_server_stopped();
@@ -1822,6 +1845,7 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
         };
         let socket = listener.as_ptr();
         self.listener.set(Some(listener));
+        bun_jsc::nsolid_agent::count_handle(self.nsolid_handle(true), true);
         self.vm().event_loop_handle.set(Some(bun_io::Loop::get()));
         if !SSL {
             // S008: `app::ListenSocket<SSL>` is a ZST opaque — safe deref.
@@ -2776,6 +2800,10 @@ impl<const SSL: bool, const DEBUG: bool> NewServer<SSL, DEBUG> {
                                     && refused_ports.len() < MAX_REFUSED_PORTS
                                     && let Some(ls) = this_ref.listener.take()
                                 {
+                                    bun_jsc::nsolid_agent::count_handle(
+                                        this_ref.nsolid_handle(true),
+                                        false,
+                                    );
                                     refused_ports.push(ls);
                                     continue;
                                 }
