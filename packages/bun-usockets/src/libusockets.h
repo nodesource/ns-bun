@@ -607,6 +607,31 @@ void us_wakeup_loop(us_loop_r loop) nonnull_fn_decl;
 /* Hook up timers in existing loop */
 void us_loop_integrate(us_loop_r loop) nonnull_fn_decl;
 
+/* How the JavaScript event loop on a thread spends its time: the loop with a jsc_vm.
+ * Only that thread writes it; another thread reads it with __atomic loads, for as
+ * long as the thread lives. Times are us_loop_timing_now_ns() readings. */
+struct us_loop_timing {
+    /* Time spent waiting in the poll, not counting a wait in progress. */
+    uint64_t idle_ns;
+    /* When the wait in progress began; 0 when the loop is not waiting. */
+    uint64_t entry_ns;
+    /* When the last poll returned; 0 while the loop is waiting. */
+    uint64_t exit_ns;
+    /* When the loop first polled; 0 until then. */
+    uint64_t start_ns;
+    /* Outermost ticks: a nested tick (waitForPromise) is part of its caller's. */
+    uint64_t iterations;
+    /* Events the polls returned. */
+    uint64_t events;
+    /* Events returned by polls that did not wait, which were ready before the poll. */
+    uint64_t events_waiting;
+};
+struct us_loop_timing *us_loop_timing_of_current_thread(void);
+uint64_t us_loop_timing_now_ns(void);
+/* Called, when set, on the loop's thread at the start of each outermost tick, before the
+ * poll, with the thread's timing and the time. */
+extern void (*us_loop_iteration_hook)(struct us_loop_timing *timing, uint64_t now_ns);
+
 /* Public interfaces for polls */
 
 /* A fallthrough poll does not keep the loop running, it falls through */

@@ -48,6 +48,22 @@ extern const size_t Bun__lock__size;
 
 extern void Bun__internal_ensureDateHeaderTimerIsEnabled(struct us_loop_t *loop);
 
+static _Thread_local struct us_loop_timing us_js_loop_timing;
+
+struct us_loop_timing *us_loop_timing_of_current_thread(void) {
+    return &us_js_loop_timing;
+}
+
+uint64_t us_loop_timing_now_ns(void) {
+#ifdef LIBUS_USE_LIBUV
+    return uv_hrtime();
+#else
+    return us_internal_monotonic_ns();
+#endif
+}
+
+void (*us_loop_iteration_hook)(struct us_loop_timing *timing, uint64_t now_ns) = NULL;
+
 #ifdef LIBUS_USE_LIBUV
 
 void sweep_timer_cb(struct us_internal_callback_t *cb);

@@ -1,5 +1,8 @@
 #include "root.h"
 #include "BunClientData.h"
+#include "BunJSCEventLoop.h"
+#include "ZigGlobalObject.h"
+#include "libusockets.h"
 
 #include <atomic>
 
@@ -140,4 +143,28 @@ extern "C" unsigned int Bun__JSC_onBeforeWait(JSC::VM* _Nonnull vm, uint64_t now
         *releasedHeapAccess = 1;
     }
     return runAgainInMs;
+}
+
+extern "C" uint64_t Bun__readOriginTimer(void*);
+
+namespace Bun {
+
+// perf_hooks' `nodeTiming.loopStart` and `nodeTiming.idleTime`.
+JSC_DEFINE_HOST_FUNCTION(jsFunctionEventLoopTiming, (JSC::JSGlobalObject * globalObject, JSC::CallFrame*))
+{
+    auto& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    auto* timing = us_loop_timing_of_current_thread();
+    double loopStart = -1;
+    if (uint64_t start = timing->start_ns) {
+        uint64_t now = us_loop_timing_now_ns();
+        uint64_t sinceOrigin = Bun__readOriginTimer(defaultGlobalObject(globalObject)->bunVM());
+        loopStart = (static_cast<double>(start) - (static_cast<double>(now) - static_cast<double>(sinceOrigin))) / 1e6;
+    }
+    JSC::MarkedArgumentBuffer values;
+    values.append(JSC::jsNumber(loopStart));
+    values.append(JSC::jsNumber(timing->idle_ns / 1e6));
+    RELEASE_AND_RETURN(scope, JSC::JSValue::encode(JSC::constructArray(globalObject, static_cast<JSC::ArrayAllocationProfile*>(nullptr), values)));
+}
+
 }

@@ -526,6 +526,23 @@ void us_loop_run_bun_tick(struct us_loop_t *loop, const struct timespec* timeout
         }
     }
 
+    struct us_loop_timing *timing = loop->data.jsc_vm ? us_loop_timing_of_current_thread() : NULL;
+    if (timing) {
+        const uint64_t poll_now_ns = us_loop_timing_now_ns();
+        if (loop->data.tick_depth == 1) {
+            if (us_loop_iteration_hook)
+                us_loop_iteration_hook(timing, poll_now_ns);
+            __atomic_store_n(&timing->iterations, timing->iterations + 1, __ATOMIC_RELAXED);
+        }
+        if (!timing->start_ns)
+            __atomic_store_n(&timing->start_ns, poll_now_ns, __ATOMIC_RELAXED);
+        /* A wait after a wakeup can still block: the wakeup may already be drained. */
+        if (!timeout || timeout->tv_sec != 0 || timeout->tv_nsec != 0) {
+            __atomic_store_n(&timing->exit_ns, 0, __ATOMIC_RELAXED);
+            __atomic_store_n(&timing->entry_ns, poll_now_ns, __ATOMIC_RELEASE);
+        }
+    }
+
     /* Fetch ready polls */
 #ifdef LIBUS_USE_EPOLL
     /* A zero timespec already has a fast path in ep_poll (fs/eventpoll.c):
@@ -543,6 +560,21 @@ void us_loop_run_bun_tick(struct us_loop_t *loop, const struct timespec* timeout
         will_idle_inside_event_loop ? 0 : KEVENT_FLAG_IMMEDIATE,
         timeout);
 #endif
+
+    if (timing) {
+        const uint64_t poll_now_ns = us_loop_timing_now_ns();
+        const uint64_t entry_ns = timing->entry_ns;
+        if (entry_ns) {
+            __atomic_store_n(&timing->idle_ns, timing->idle_ns + (poll_now_ns - entry_ns), __ATOMIC_RELAXED);
+            __atomic_store_n(&timing->entry_ns, 0, __ATOMIC_RELAXED);
+        }
+        __atomic_store_n(&timing->exit_ns, poll_now_ns, __ATOMIC_RELEASE);
+        if (loop->num_ready_polls > 0) {
+            __atomic_store_n(&timing->events, timing->events + loop->num_ready_polls, __ATOMIC_RELAXED);
+            if (!will_idle_inside_event_loop)
+                __atomic_store_n(&timing->events_waiting, timing->events_waiting + loop->num_ready_polls, __ATOMIC_RELAXED);
+        }
+    }
 
     /* Anything that stops a poll from here on scrubs this batch (us_internal_loop_update_pending_ready_polls). */
     loop->current_ready_poll = 0;

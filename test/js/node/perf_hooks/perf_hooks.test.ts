@@ -617,3 +617,47 @@ describe("monitorEventLoopDelay with a resolution above the int32 range", () => 
     });
   });
 });
+
+test("eventLoopUtilization measures the time the event loop spends waiting", async () => {
+  await using proc = Bun.spawn({
+    cmd: [
+      bunExe(),
+      "-e",
+      `const { performance } = require("node:perf_hooks");
+       setTimeout(() => {
+         const beforeBusy = performance.eventLoopUtilization();
+         const end = performance.now() + 100;
+         while (performance.now() < end) {}
+         const busy = performance.eventLoopUtilization(beforeBusy);
+         setTimeout(() => {
+           const beforeIdle = performance.eventLoopUtilization();
+           setTimeout(() => {
+             const idle = performance.eventLoopUtilization(beforeIdle);
+             const { loopStart, idleTime } = performance.nodeTiming;
+             console.log(JSON.stringify({
+               loopStarted: loopStart > 0 && loopStart < performance.now(),
+               idleTimeCounted: idleTime > 0,
+               busy: busy.utilization,
+               busyIdle: busy.idle,
+               idleUnderHalf: idle.utilization < 0.5,
+               idleWaited: idle.idle > 50,
+             }));
+           }, 150);
+         }, 0);
+       }, 10);`,
+    ],
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "inherit",
+  });
+  const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+  expect(JSON.parse(stdout)).toEqual({
+    loopStarted: true,
+    idleTimeCounted: true,
+    busy: 1,
+    busyIdle: 0,
+    idleUnderHalf: true,
+    idleWaited: true,
+  });
+  expect(exitCode).toBe(0);
+});
