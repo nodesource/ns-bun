@@ -441,7 +441,9 @@ describe("FileHandle", () => {
   // Node.js closes a FileHandle's fd in its native finalizer and raises
   // ERR_INVALID_STATE (DEP0137 end-of-life) when the handle is collected
   // without close(). Bun must reclaim the fd and surface the same diagnostic.
-  it.concurrent.skipIf(isWindows)(
+  // The fixture counts every fd of its process: with the N|Solid agent on,
+  // the agent's connection to the Console opens while it counts.
+  it.concurrent.skipIf(isWindows || !!process.env.NSOLID_GRPC)(
     "FileHandle collected without close() closes the fd and raises ERR_INVALID_STATE",
     async () => {
       const fixture = /* js */ `
