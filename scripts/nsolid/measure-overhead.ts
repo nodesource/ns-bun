@@ -22,8 +22,8 @@ const GATEWAY = join(import.meta.dir, "stub-gateway.ts");
 // Latency histogram: 10 µs buckets up to 100 ms.
 const LATENCY_BUCKETS = 10_000;
 const CONNECTIONS = 32;
-const LOAD_SECONDS = 10;
-const ROUNDS = 5;
+const LOAD_SECONDS = 8;
+const ROUNDS = 6;
 
 // The budget: deltas against the same binary without the agent.
 const BUDGET = {
@@ -155,8 +155,9 @@ async function measure(bin: string) {
     proc.kill();
     await proc.exited;
   };
-  // Two clients of half the connections each; the server's CPU use meanwhile
-  // shows whether it, and not the clients, was the bottleneck.
+  // Two clients of half the connections each. The server's CPU time per
+  // request moves less than its throughput where the host is shared, since
+  // time the machine gives to others is not counted in it.
   const load = async (server: Bun.Subprocess, port: number) => {
     const ticks = cpuTicks(server.pid);
     const outputs = await Promise.all(
@@ -171,7 +172,7 @@ async function measure(bin: string) {
         return JSON.parse(text) as { count: number; errors: number; histogram: number[] };
       }),
     );
-    const serverCpuPercent = (cpuTicks(server.pid) - ticks) / LOAD_SECONDS;
+    const serverTicks = cpuTicks(server.pid) - ticks;
     const count = outputs.reduce((sum, o) => sum + o.count, 0);
     const histogram = outputs[0].histogram.map((n, i) => n + outputs[1].histogram[i]);
     const quantile = (q: number) => {
@@ -184,7 +185,8 @@ async function measure(bin: string) {
       p50: quantile(0.5),
       p99: quantile(0.99),
       errors: outputs[0].errors + outputs[1].errors,
-      serverCpuPercent,
+      serverCpuPercent: serverTicks / LOAD_SECONDS,
+      cpuUsPerRequest: (serverTicks * 10_000) / count,
     };
   };
 
@@ -224,13 +226,15 @@ async function measure(bin: string) {
   }
 
   // Throughput and latency: ROUNDS rounds of LOAD_SECONDS, the setups taking
-  // turns so that drift spreads over all of them. The median round counts,
-  // with its peak RSS and what the gateway received from it.
+  // turns, each round starting with the next one, so that drift spreads over
+  // all of them. Each figure is the median of its rounds; the trace exports
+  // are the median round's by throughput.
   await gatewayCounts();
   for (const kind of Object.keys(SERVERS) as (keyof typeof SERVERS)[]) {
     const rounds: Record<string, any[]> = {};
     for (let r = 0; r < ROUNDS; r++) {
-      for (const setup of setups) {
+      for (let i = 0; i < setups.length; i++) {
+        const setup = setups[(i + r) % setups.length];
         const { proc, port } = await startServer(kind, setup.env);
         await Bun.sleep(3000);
         await gatewayCounts();
@@ -243,21 +247,24 @@ async function measure(bin: string) {
       }
     }
     for (const setup of setups) {
-      const list = rounds[setup.name].slice().sort((a, b) => a.rps - b.rps);
-      const mid = list[ROUNDS >> 1];
+      const list = rounds[setup.name];
+      const of = (key: string) => median(list.map(x => x[key]));
+      const mid = list.slice().sort((a, b) => a.rps - b.rps)[ROUNDS >> 1];
       const traces = Object.entries(mid.gateway as Record<string, { calls: number; bytes: number }>).find(([path]) =>
         path.includes("TraceService"),
       )?.[1];
       results[setup.name].http[kind] = {
-        rps: mid.rps,
-        p50Ms: mid.p50,
-        p99Ms: mid.p99,
-        errors: mid.errors,
-        serverCpuPercent: mid.serverCpuPercent,
-        peakRssMb: mid.peakRssMb,
+        rps: of("rps"),
+        cpuUsPerRequest: of("cpuUsPerRequest"),
+        p50Ms: of("p50"),
+        p99Ms: of("p99"),
+        serverCpuPercent: of("serverCpuPercent"),
+        peakRssMb: of("peakRssMb"),
+        errors: list.reduce((sum, x) => sum + x.errors, 0),
         traceExports: traces?.calls ?? 0,
         traceBytes: traces?.bytes ?? 0,
-        rpsRounds: rounds[setup.name].map(x => Math.round(x.rps)),
+        rpsRounds: list.map(x => Math.round(x.rps)),
+        cpuUsRounds: list.map(x => round(x.cpuUsPerRequest, 2)),
       };
     }
   }
@@ -293,21 +300,35 @@ function report(measured: Awaited<ReturnType<typeof measure>>) {
       `${kind}, hello world, ${CONNECTIONS} connections, the median of ${ROUNDS} rounds of ${LOAD_SECONDS} s:`,
       "",
     );
-    row("Setup", "Requests/s", "Rounds", "Change", "p50", "p99", "Server CPU", "Peak RSS", "Trace exports (bytes)");
-    row("---", "---:", "---:", "---:", "---:", "---:", "---:", "---:", "---:");
+    row(
+      "Setup",
+      "Requests/s",
+      "Rounds",
+      "Change",
+      "CPU per request",
+      "Change",
+      "p50",
+      "p99",
+      "Peak RSS",
+      "Trace exports (bytes)",
+    );
+    row("---", "---:", "---:", "---:", "---:", "---:", "---:", "---:", "---:", "---:");
+    const percent = (x: number) => `${x >= 0 ? "+" : ""}${round(x)}%`;
     for (const [name, r] of Object.entries(results) as [string, any][]) {
       const h = r.http[kind];
-      const change = (h.rps / none.http[kind].rps - 1) * 100;
+      const base = none.http[kind];
+      const change = (h.rps / base.rps - 1) * 100;
+      const cpuChange = (h.cpuUsPerRequest / base.cpuUsPerRequest - 1) * 100;
+      const budget = kind === "Bun.serve" ? ` (${verdict(-change <= BUDGET.throughputLossPercent)})` : "";
       row(
         name,
         Math.round(h.rps),
         `${Math.min(...h.rpsRounds)}–${Math.max(...h.rpsRounds)}`,
-        name === "no agent"
-          ? ""
-          : `${change >= 0 ? "+" : ""}${round(change)}%${kind === "Bun.serve" ? ` (${verdict(-change <= BUDGET.throughputLossPercent)})` : ""}`,
+        name === "no agent" ? "" : `${percent(change)}${budget}`,
+        `${round(h.cpuUsPerRequest, 2)} µs`,
+        name === "no agent" ? "" : percent(cpuChange),
         `${round(h.p50Ms, 2)} ms`,
         `${round(h.p99Ms, 2)} ms`,
-        `${Math.round(h.serverCpuPercent)}%`,
         `${round(h.peakRssMb)} MB`,
         h.traceExports ? `${h.traceExports} (${round(h.traceBytes / 1e6)} MB)` : "",
       );
