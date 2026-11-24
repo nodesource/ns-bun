@@ -108,7 +108,8 @@ function resource(identity: Identity) {
     attribute("host.cpu.model.name", cpus[0]?.model ?? ""),
     attribute("tagsString", identity.tags.join(",")),
   ];
-  if (identity.appVersion) attributes.push(attribute("service.version", identity.appVersion));
+  const { appVersion } = identity;
+  if (appVersion) attributes.push(attribute("service.version", appVersion));
   try {
     attributes.push(attribute("process.owner", os.userInfo().username));
   } catch {}

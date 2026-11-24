@@ -2001,7 +2001,10 @@ impl VirtualMachine {
         ) > 0;
         if !handled {
             if self.is_main_thread() {
-                crate::nsolid_agent::record_fatal_error(global_object, err.to_error().unwrap_or(err));
+                crate::nsolid_agent::record_fatal_error(
+                    global_object,
+                    err.to_error().unwrap_or(err),
+                );
             }
             // `beforeExit` has already been dispatched, so the run is winding
             // down and there is no loop turn left to defer to: print the error

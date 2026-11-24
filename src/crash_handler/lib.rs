@@ -531,7 +531,6 @@ mod draft {
     /// This is useful for testing as a crash in here will not 'panicked during a panic'.
     const ENABLE: bool = true;
 
-
     /// Only print the `Bun has crashed` message once. Once this is true, control
     /// flow is not returned to the main application.
     static HAS_PRINTED_MESSAGE: AtomicBool = AtomicBool::new(false);
@@ -2024,7 +2023,8 @@ mod draft {
                 } else {
                     let _ = writer.write_all(b": ");
                 }
-                let _ = writer.write_all(b"Bun has crashed. This indicates a bug in Bun, not your code.\n\n");
+                let _ = writer
+                    .write_all(b"Bun has crashed. This indicates a bug in Bun, not your code.\n\n");
                 let _ = writer.write_all(report_request());
                 let _ = writer.write_all(b" ");
                 if enable_ansi_colors_stderr() {
@@ -2922,10 +2922,56 @@ mod draft {
         Ok(())
     }
 
-    /// nsolid-bun reports a crash only to where BUN_CRASH_REPORT_URL says: it
-    /// has no default service to send to.
     fn is_reporting_enabled() -> bool {
-        !SUPPRESS_REPORTING.load(Ordering::Relaxed) && has_report_url()
+        if SUPPRESS_REPORTING.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        // nsolid-bun has no crash report service: it reports only to where
+        // BUN_CRASH_REPORT_URL says.
+        if Global::NSOLID_BUN {
+            return has_report_url();
+        }
+
+        // If trying to test the crash handler backend, implicitly enable reporting
+        if let Some(value) = env_var::BUN_CRASH_REPORT_URL::get() {
+            return !value.is_empty();
+        }
+
+        // Environment variable to specifically enable or disable reporting
+        if let Some(enable_crash_reporting) = env_var::BUN_ENABLE_CRASH_REPORTING::get() {
+            return enable_crash_reporting;
+        }
+
+        // A hardened build starts no other program and opens no connection that nobody asked for.
+        if cfg!(bun_hardened) {
+            return false;
+        }
+
+        // Debug builds shouldn't report to the default url by default
+        if cfg!(debug_assertions) {
+            return false;
+        }
+
+        if Environment::ENABLE_ASAN {
+            return false;
+        }
+
+        // Honor DO_NOT_TRACK (and the bunfig telemetry setting)
+        if !bun_analytics::is_enabled() {
+            return false;
+        }
+
+        if Environment::IS_CANARY {
+            return true;
+        }
+
+        // Change in v1.1.10: enable crash reporter auto upload on macOS and Windows.
+        if cfg!(target_os = "macos") || cfg!(windows) {
+            return true;
+        }
+
+        false
     }
 
     fn has_report_url() -> bool {

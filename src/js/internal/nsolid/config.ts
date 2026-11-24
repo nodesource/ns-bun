@@ -131,8 +131,9 @@ function parseTags(value: unknown): string[] {
   }
 
   tags = tags.filter(tag => Buffer.byteLength(tag) >= TAG_MIN_BYTES);
-  if (tags.length > MAX_TAGS) {
-    warn(`A maximum of 20 tags are allowed but ${tags.length} were provided. Only using the first 20 tags`);
+  const { length } = tags;
+  if (length > MAX_TAGS) {
+    warn(`A maximum of 20 tags are allowed but ${length} were provided. Only using the first 20 tags`);
     tags = tags.slice(0, MAX_TAGS);
   }
   return tags;

@@ -488,7 +488,12 @@ pub const NSOLID_BUN: bool = true;
 pub const nsolid_bun_version: &str = "0.1.0";
 
 /// What `bun --version` prints: "1.4.6 (nsolid-bun 0.1.0)".
-pub const version_line_nl: &str = concatcp!(package_json_version, " (nsolid-bun ", nsolid_bun_version, ")\n");
+pub const version_line_nl: &str = concatcp!(
+    package_json_version,
+    " (nsolid-bun ",
+    nsolid_bun_version,
+    ")\n"
+);
 
 /// This is used for `bun` without any arguments, it `package_json_version` but with canary if it is a canary build.
 /// like "1.0.0-canary.12"
@@ -848,7 +853,12 @@ pub fn crash() -> ! {
 // because it depends on analytics/js_parser/interchange — all higher-tier. Only the version constants below
 // are needed at this tier.
 
-pub const user_agent: &str = concatcp!("Bun/", package_json_version, " nsolid-bun/", nsolid_bun_version);
+pub const user_agent: &str = concatcp!(
+    "Bun/",
+    package_json_version,
+    " nsolid-bun/",
+    nsolid_bun_version
+);
 
 #[repr(transparent)]
 pub struct SyncCStr(pub *const c_char);

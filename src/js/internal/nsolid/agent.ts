@@ -318,7 +318,7 @@ class Agent {
 
   // Metrics go to the Console every `interval` over OTLP, unless paused.
   scheduleMetrics() {
-    if (this.metricsTimer) clearInterval(this.metricsTimer);
+    clearInterval(this.metricsTimer);
     this.metricsTimer = setInterval(() => {
       if (this.config.pauseMetrics || !this.session) return;
       this.collectMetrics()
@@ -352,7 +352,8 @@ class Agent {
   connectOptions() {
     if (!this.secure) return undefined;
     const tlsOptions: Record<string, any> = {};
-    if (this.ca) tlsOptions.ca = this.ca;
+    const { ca } = this;
+    if (ca) tlsOptions.ca = ca;
     const { cert, key } = this.identity ?? {};
     if (cert && key) {
       tlsOptions.cert = cert;

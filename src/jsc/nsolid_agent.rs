@@ -63,11 +63,15 @@ pub fn record_fatal_error(global: &JSGlobalObject, error: JSValue) {
 /// async-signal-safe; a thread of its own does the reporting.
 #[cfg(unix)]
 mod signals {
-    use core::ffi::{CStr, c_int, c_void};
+    use bun_sys::Fd;
+    use core::ffi::{CStr, c_int};
     use core::sync::atomic::{AtomicI32, Ordering};
 
-    const SIGNALS: [(c_int, &CStr); 3] =
-        [(libc::SIGINT, c"SIGINT"), (libc::SIGTERM, c"SIGTERM"), (libc::SIGHUP, c"SIGHUP")];
+    const SIGNALS: [(c_int, &CStr); 3] = [
+        (libc::SIGINT, c"SIGINT"),
+        (libc::SIGTERM, c"SIGTERM"),
+        (libc::SIGHUP, c"SIGHUP"),
+    ];
     // A little longer than the report itself may take.
     const ACK_TIMEOUT_MS: c_int = 6_000;
 
@@ -101,47 +105,54 @@ mod signals {
             return;
         }
         for (signal, _) in SIGNALS {
-            // SAFETY: plain sigaction calls with zeroed, then filled, structs.
+            let mut current: libc::sigaction = bun_core::ffi::zeroed();
+            // SAFETY: a null new action only reads the current one into valid memory.
+            if unsafe { libc::sigaction(signal, core::ptr::null(), &raw mut current) } != 0
+                || current.sa_sigaction != libc::SIG_DFL
+            {
+                continue;
+            }
+            let mut action: libc::sigaction = bun_core::ffi::zeroed();
+            action.sa_sigaction = on_signal as extern "C" fn(c_int) as usize;
+            // SAFETY: both point to valid memory, and the handler is never unloaded.
             unsafe {
-                let mut current: libc::sigaction = core::mem::zeroed();
-                if libc::sigaction(signal, core::ptr::null(), &mut current) != 0
-                    || current.sa_sigaction != libc::SIG_DFL
-                {
-                    continue;
-                }
-                let mut action: libc::sigaction = core::mem::zeroed();
-                action.sa_sigaction = on_signal as *const () as usize;
-                libc::sigemptyset(&mut action.sa_mask);
-                libc::sigaction(signal, &action, core::ptr::null_mut());
+                libc::sigemptyset(&raw mut action.sa_mask);
+                libc::sigaction(signal, &raw const action, core::ptr::null_mut());
             }
         }
     }
 
     extern "C" fn on_signal(signal: c_int) {
-        let byte = signal as u8;
-        // SAFETY: write(2), poll(2), signal(2) and raise(3) are async-signal-safe.
+        let to_reporter = Fd::from_native(TO_REPORTER.load(Ordering::Relaxed));
+        // write(2), poll(2), signal(2) and raise(3) are async-signal-safe.
+        if matches!(bun_sys::write(to_reporter, &[signal as u8]), Ok(1)) {
+            let mut ack = libc::pollfd {
+                fd: FROM_REPORTER.load(Ordering::Relaxed),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one pollfd.
+            unsafe { libc::poll(&raw mut ack, 1, ACK_TIMEOUT_MS) };
+        }
+        // SAFETY: no pointers.
         unsafe {
-            if libc::write(TO_REPORTER.load(Ordering::Relaxed), (&raw const byte).cast::<c_void>(), 1) == 1 {
-                let mut ack = libc::pollfd { fd: FROM_REPORTER.load(Ordering::Relaxed), events: libc::POLLIN, revents: 0 };
-                libc::poll(&mut ack, 1, ACK_TIMEOUT_MS);
-            }
             libc::signal(signal, libc::SIG_DFL);
             libc::raise(signal);
         }
     }
 
     fn report_signals(from_handler: c_int, to_handler: c_int) {
-        let mut byte = 0u8;
-        loop {
-            // SAFETY: one byte into `byte`.
-            if unsafe { libc::read(from_handler, (&raw mut byte).cast::<c_void>(), 1) } != 1 {
-                return;
-            }
-            let signal = c_int::from(byte);
-            let name = SIGNALS.iter().find(|(s, _)| *s == signal).map(|(_, name)| *name);
+        let (from_handler, to_handler) =
+            (Fd::from_native(from_handler), Fd::from_native(to_handler));
+        let mut byte = [0u8];
+        while matches!(bun_sys::read(from_handler, &mut byte), Ok(1)) {
+            let signal = c_int::from(byte[0]);
+            let name = SIGNALS
+                .iter()
+                .find(|(s, _)| *s == signal)
+                .map(|(_, name)| *name);
             super::report_exit(signal, name);
-            // SAFETY: one byte from `byte`.
-            unsafe { libc::write(to_handler, (&raw const byte).cast::<c_void>(), 1) };
+            let _ = bun_sys::write(to_handler, &byte);
         }
     }
 }
