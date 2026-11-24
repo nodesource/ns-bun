@@ -48,6 +48,32 @@ const threadMetrics: [string, string, ValueType][] = [
   ["externalMem", "byte", "int"],
 ];
 
+// N|Solid's event-loop and GC thread metrics, with the kinds and units it
+// sends them with (src/nsolid.h). The collection durations go out as the
+// `gcDurUs` summary.
+const loopAndGcMetrics: [string, Kind, string, ValueType][] = [
+  ["gcCount", "counter", "", "int"],
+  ["gcForcedCount", "counter", "", "int"],
+  ["gcFullCount", "counter", "", "int"],
+  ["gcMajorCount", "counter", "", "int"],
+  ["loopIdleTime", "gauge", "ns", "int"],
+  ["loopIterations", "counter", "", "int"],
+  ["loopIterWithEvents", "counter", "", "int"],
+  ["eventsProcessed", "counter", "", "int"],
+  ["eventsWaiting", "gauge", "", "int"],
+  ["providerDelay", "gauge", "ns", "int"],
+  ["processingDelay", "gauge", "ns", "int"],
+  ["loopTotalCount", "counter", "", "int"],
+  ["loopUtilization", "gauge", "", "double"],
+  ["res5s", "gauge", "", "double"],
+  ["res1m", "gauge", "", "double"],
+  ["res5m", "gauge", "", "double"],
+  ["res15m", "gauge", "", "double"],
+  ["loopAvgTasks", "gauge", "", "double"],
+  ["loopEstimatedLag", "gauge", "ms", "double"],
+  ["loopIdlePercent", "gauge", "", "double"],
+];
+
 const nanos = (ms: number) => BigInt(Math.round(ms)) * 1_000_000n;
 
 function attribute(key: string, value: string | number) {
@@ -116,20 +142,49 @@ function resource(identity: Identity) {
   return { attributes };
 }
 
+function threadAttributes(thread: Record<string, any>) {
+  return [attribute("thread.id", thread.threadId), attribute("thread.name", thread.threadName)];
+}
+
 function resourceMetrics(identity: Identity, proc: Record<string, any>, threads: Record<string, any>[]) {
   const start = identity.processStartMs;
   const metrics: object[] = [];
   for (const [name, kind, unit, valueType] of processMetrics) {
     metrics.push(metric(name, kind, unit, [point(proc[name], valueType, proc.timestamp, start)]));
   }
+  const withHeap = threads.filter(thread => thread.heapTotal !== undefined);
   for (const [name, unit, valueType] of threadMetrics) {
-    const points = threads.map(thread =>
-      point(thread[name === "externalMem" ? "external" : name], valueType, thread.timestamp, start, [
-        attribute("thread.id", thread.threadId),
-        attribute("thread.name", thread.threadName),
-      ]),
+    const points = withHeap.map(thread =>
+      point(
+        thread[name === "externalMem" ? "external" : name],
+        valueType,
+        thread.timestamp,
+        start,
+        threadAttributes(thread),
+      ),
     );
     if (points.length) metrics.push(metric(name, "gauge", unit, points));
+  }
+  const withLoop = threads.filter(thread => thread.loopIterations !== undefined);
+  for (const [name, kind, unit, valueType] of loopAndGcMetrics) {
+    const points = withLoop.map(thread =>
+      point(thread[name], valueType, thread.timestamp, start, threadAttributes(thread)),
+    );
+    if (points.length) metrics.push(metric(name, kind, unit, points));
+  }
+  if (withLoop.length) {
+    const points = withLoop.map(thread => ({
+      start_time_unix_nano: nanos(start),
+      time_unix_nano: nanos(thread.timestamp),
+      count: 0n,
+      sum: 0,
+      quantile_values: [
+        { quantile: 0.5, value: thread.gcDurUsMedian },
+        { quantile: 0.99, value: thread.gcDurUs99Ptile },
+      ],
+      attributes: threadAttributes(thread),
+    }));
+    metrics.push({ name: "gcDurUs", unit: "us", summary: { data_points: points } });
   }
   return { resource: resource(identity), scope_metrics: [{ scope: SCOPE, metrics }] };
 }

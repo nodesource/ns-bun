@@ -180,12 +180,15 @@ JSC_DEFINE_HOST_FUNCTION(functionGCAndSweep,
     return JSValue::encode(jsNumber(vm.heap.sizeAfterLastFullCollection()));
 }
 
+extern "C" void Bun__NSolid__noteRequestedCollection(bool full);
+
 JSC_DECLARE_HOST_FUNCTION(functionFullGC);
 JSC_DEFINE_HOST_FUNCTION(functionFullGC,
     (JSGlobalObject * globalObject, CallFrame*))
 {
     VM& vm = globalObject->vm();
     JSLockHolder lock(vm);
+    Bun__NSolid__noteRequestedCollection(true);
     vm.heap.collectSync(CollectionScope::Full);
     return JSValue::encode(jsNumber(vm.heap.sizeAfterLastFullCollection()));
 }
@@ -196,6 +199,7 @@ JSC_DEFINE_HOST_FUNCTION(functionEdenGC,
 {
     VM& vm = globalObject->vm();
     JSLockHolder lock(vm);
+    Bun__NSolid__noteRequestedCollection(false);
     vm.heap.collectSync(CollectionScope::Eden);
     return JSValue::encode(jsNumber(vm.heap.sizeAfterLastEdenCollection()));
 }

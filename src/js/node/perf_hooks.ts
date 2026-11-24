@@ -94,21 +94,39 @@ class PerformanceNodeTiming {
 Object.setPrototypeOf(PerformanceNodeTiming.prototype, PerformanceEntry.prototype);
 Object.setPrototypeOf(PerformanceNodeTiming, PerformanceEntry);
 
+// [loopStart, idleTime] for this thread's event loop, in milliseconds on
+// performance.now()'s clock; loopStart is -1 until the loop first polls.
+const eventLoopTiming = $newCppFunction("BunJSCEventLoop.cpp", "jsFunctionEventLoopTiming", 0);
+
 function createPerformanceNodeTiming() {
   const object = Object.create(PerformanceNodeTiming.prototype);
 
   object.bootstrapComplete = object.environment = object.nodeStart = object.v8Start = performance.timeOrigin;
-  object.loopStart = object.idleTime = 1;
+  Object.defineProperty(object, "loopStart", { get: () => eventLoopTiming()[0], enumerable: true, configurable: true });
+  Object.defineProperty(object, "idleTime", { get: () => eventLoopTiming()[1], enumerable: true, configurable: true });
   object.loopExit = -1;
   return object;
 }
 
-function eventLoopUtilization(_utilization1, _utilization2) {
-  return {
-    idle: 0,
-    active: 0,
-    utilization: 0,
-  };
+// https://github.com/nodejs/node/blob/v26.3.0/lib/internal/perf/event_loop_utilization.js
+function eventLoopUtilization(utilization1, utilization2) {
+  const [loopStart, idleTime] = eventLoopTiming();
+  if (loopStart <= 0) {
+    return { idle: 0, active: 0, utilization: 0 };
+  }
+  if (utilization2) {
+    const idle = utilization1.idle - utilization2.idle;
+    const active = utilization1.active - utilization2.active;
+    return { idle, active, utilization: active / (idle + active) };
+  }
+  const idle = idleTime;
+  const active = performance.now() - loopStart - idle;
+  if (!utilization1) {
+    return { idle, active, utilization: active / (idle + active) };
+  }
+  const idleDelta = idle - utilization1.idle;
+  const activeDelta = active - utilization1.active;
+  return { idle: idleDelta, active: activeDelta, utilization: activeDelta / (idleDelta + activeDelta) };
 }
 
 const kNodeObserver = Symbol("kNodeObserver");

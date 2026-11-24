@@ -1732,6 +1732,7 @@ impl VirtualMachine {
     /// `Bun.gc(force)` and `gc()`. Whoever asks for a synchronous collection reads the footprint next: what the collection
     /// freed goes back to the OS now, not whenever the allocator's purge delay has passed.
     pub fn garbage_collect_from_js(&self, sync: bool) -> usize {
+        crate::nsolid_agent::note_requested_collection(sync);
         let size = self.garbage_collect(sync);
         if sync {
             bun_core::Global::mimalloc_cleanup(true);

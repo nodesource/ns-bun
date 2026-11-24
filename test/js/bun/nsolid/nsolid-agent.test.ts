@@ -92,6 +92,7 @@ async function grpcGateway(commands: object[]) {
         callback(null, {});
       });
     },
+    ExportBlockedLoop: unary("ExportBlockedLoop"),
     ExportExit: unary("ExportExit"),
     ExportInfo: unary("ExportInfo"),
     ExportMetrics: unary("ExportMetrics"),
@@ -99,6 +100,7 @@ async function grpcGateway(commands: object[]) {
     ExportReconfigure: unary("ExportReconfigure"),
     ExportSourceCode: unary("ExportSourceCode"),
     ExportStartupTimes: unary("ExportStartupTimes"),
+    ExportUnblockedLoop: unary("ExportUnblockedLoop"),
   });
   server.addService(opentelemetry.proto.collector.metrics.v1.MetricsService.service, {
     Export: unary("MetricsExport"),
@@ -332,8 +334,8 @@ describe("N|Solid agent", () => {
       {
         requestId: "r-profile",
         id: "x",
-        command: "profile",
-        args: { profile: { thread_id: 0, duration: 1000, cpu_profile: {} } },
+        command: "heap_profile",
+        args: { profile: { thread_id: 0, duration: 1000, heap_profile: {} } },
       },
       { requestId: "r-packages", id: "x", command: "packages" },
       { requestId: "r-metrics", id: "x", command: "metrics" },
@@ -369,7 +371,25 @@ describe("N|Solid agent", () => {
       recorded: undefined,
     });
     expect(Number(info.common.recorded.seconds)).toBeGreaterThan(0);
-    const { versions, cpuCores, cpuModel, totalMem, processStart, execPath, kernelVersion, ...body } = info.body;
+    const {
+      versions,
+      cpuCores,
+      cpuModel,
+      totalMem,
+      processStart,
+      execPath,
+      kernelVersion,
+      runtime,
+      capabilities,
+      ...body
+    } = info.body;
+    expect({ runtime, capabilities }).toEqual({
+      runtime: { name: "bun", version: Bun.version, engine: "jsc", agent_version: versions.nsolid_bun },
+      capabilities: {
+        commands: ["info", "metrics", "packages", "profile", "reconfigure", "snapshot", "startup_times"],
+        settings: ["assetsEnabled", "blockedLoopThreshold", "interval", "pauseMetrics", "redactSnapshots", "tags"],
+      },
+    });
     expect(body).toEqual({
       app: "shop",
       appVersion: "1.2.3",
@@ -423,7 +443,7 @@ describe("N|Solid agent", () => {
       tracingModulesBlacklist: 0,
     });
 
-    const notAvailable = { code: 404, message: "Resource not available" };
+    const notAvailable = { code: 404, message: "Resource not available(1006)" };
     const [asset, packages, metrics, source] = await Promise.all([
       gateway.next("ExportAsset"),
       gateway.next("ExportPackages"),
@@ -519,8 +539,15 @@ describe("N|Solid agent", () => {
         "cpuUserPercent",
         "ctxSwitchInvoluntaryCount",
         "ctxSwitchVoluntaryCount",
+        "eventsProcessed",
+        "eventsWaiting",
         "externalMem",
         "freeMem",
+        "gcCount",
+        "gcDurUs",
+        "gcForcedCount",
+        "gcFullCount",
+        "gcMajorCount",
         "heapTotal",
         "heapUsed",
         "ipcReceivedCount",
@@ -528,8 +555,22 @@ describe("N|Solid agent", () => {
         "load15m",
         "load1m",
         "load5m",
+        "loopAvgTasks",
+        "loopEstimatedLag",
+        "loopIdlePercent",
+        "loopIdleTime",
+        "loopIterWithEvents",
+        "loopIterations",
+        "loopTotalCount",
+        "loopUtilization",
         "pageFaultHardCount",
         "pageFaultSoftCount",
+        "processingDelay",
+        "providerDelay",
+        "res15m",
+        "res1m",
+        "res5m",
+        "res5s",
         "rss",
         "signalCount",
         "swapCount",
@@ -554,6 +595,525 @@ describe("N|Solid agent", () => {
     proc.stdin.write("stop\n");
     expect((await lines.next()).value).toBe("exited");
     await exportWhere(r => heapThreads(r).every((t: any) => t["thread.id"] !== "1"));
+  });
+
+  test.concurrent("exports each thread's event-loop and GC metrics, as N|Solid defines them", async () => {
+    await using gateway = await grpcGateway([]);
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `for await (const line of console) {
+           if (line === "gc") Bun.gc(true);
+           if (line === "block") { const end = Date.now() + 500; while (Date.now() < end) {} }
+           console.log(line);
+         }`,
+      ],
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "inherit",
+      env: { ...bunEnv, NSOLID_GRPC: `127.0.0.1:${gateway.port}`, NSOLID_GRPC_INSECURE: "1", NSOLID_INTERVAL: "100" },
+    });
+    const nextLine = lineReader(proc.stdout);
+    const mainThread = (request: any) => {
+      const values: Record<string, any> = {};
+      for (const metric of request.resource_metrics[0].scope_metrics[0].metrics) {
+        const point = (metric.gauge ?? metric.sum ?? metric.summary)?.data_points.find((p: any) =>
+          p.attributes?.some((a: any) => a.key === "thread.id" && a.value.int_value === "0"),
+        );
+        if (!point) continue;
+        values[metric.name] = metric.summary
+          ? Object.fromEntries(point.quantile_values.map((q: any) => [q.quantile, q.value]))
+          : (point.as_double ?? Number(point.as_int));
+        if (metric.sum) values[metric.name + "Kind"] = metric.sum.is_monotonic ? "counter" : "sum";
+      }
+      return values;
+    };
+    const exportWhere = async (condition: (thread: Record<string, any>) => boolean) => {
+      for (;;) {
+        const thread = mainThread(await gateway.next("MetricsExport"));
+        if (condition(thread)) return thread;
+      }
+    };
+
+    const first = await exportWhere(thread => thread.loopIterations > 0);
+    expect({
+      iterationsKind: first.loopIterationsKind,
+      gcCountKind: first.gcCountKind,
+      utilization: first.loopUtilization >= 0 && first.loopUtilization <= 1,
+      idlePercent: Math.abs(first.loopIdlePercent - (1 - first.loopUtilization) * 100) < 1e-6,
+      totalCount: first.loopTotalCount === first.loopIterations,
+      idleTime: first.loopIdleTime > 0,
+      quantiles: Object.keys(first.gcDurUs).sort(),
+    }).toEqual({
+      iterationsKind: "counter",
+      gcCountKind: "counter",
+      utilization: true,
+      idlePercent: true,
+      totalCount: true,
+      idleTime: true,
+      quantiles: ["0.5", "0.99"],
+    });
+
+    proc.stdin.write("gc\n");
+    expect(await nextLine()).toBe("gc");
+    const collected = await exportWhere(thread => thread.gcForcedCount >= 1);
+    expect({
+      forced: collected.gcForcedCount,
+      full: collected.gcFullCount,
+      counted: collected.gcCount >= 1 && collected.gcMajorCount >= 1,
+      timed: collected.gcDurUs["0.5"] > 0 && collected.gcDurUs["0.99"] >= collected.gcDurUs["0.5"],
+    }).toEqual({ forced: 1, full: 1, counted: true, timed: true });
+
+    // A loop stuck in a task shows as busy, and lagging by the time since it
+    // last polled.
+    proc.stdin.write("block\n");
+    const blocked = await exportWhere(thread => thread.loopEstimatedLag >= 100);
+    expect(blocked.loopUtilization).toBeGreaterThan(0.9);
+    expect(await nextLine()).toBe("block");
+  });
+
+  // An asset's messages: the request, thread and metadata of the first, the
+  // JSON from the data, and the duration of the last, which completes it.
+  const assetOf = (messages: any[]) => {
+    const data = Buffer.concat(messages.filter(m => m.data?.length).map(m => m.data));
+    const last = messages.at(-1);
+    return {
+      requestId: messages[0].common.requestId,
+      command: messages[0].common.command,
+      threadId: Number(messages[0].thread_id),
+      error: messages[0].common.error,
+      complete: !!last.complete,
+      duration: Number(last.duration),
+      chunkSizes: messages.filter(m => m.data?.length).map(m => m.data.length),
+      text: data.toString(),
+      profile: data.length ? JSON.parse(data.toString()) : undefined,
+    };
+  };
+  const spawnAgent = (
+    gateway: { port: number },
+    script: string,
+    extraEnv: Record<string, string> = {},
+    args: string[] = [],
+  ) =>
+    Bun.spawn({
+      cmd: [bunExe(), ...args, "-e", script],
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "inherit",
+      env: { ...bunEnv, NSOLID_GRPC: `127.0.0.1:${gateway.port}`, NSOLID_GRPC_INSECURE: "1", ...extraEnv },
+    });
+
+  describe("takes CPU profiles", () => {
+    const profileCommand = (requestId: string, threadId: number, duration: number) => ({
+      requestId,
+      id: "x",
+      command: "profile",
+      args: { profile: { thread_id: threadId, duration, cpu_profile: {} } },
+    });
+    const functionsOf = (profile: any) => new Set(profile.nodes.map((n: any) => n.callFrame.functionName));
+    const hitsOf = (profile: any, name: string) =>
+      profile.samples.filter(
+        (id: number) => profile.nodes.find((n: any) => n.id === id).callFrame.functionName === name,
+      ).length;
+
+    test.concurrent("of the main thread and of a worker, with the nodes V8's profiles have", async () => {
+      await using gateway = await grpcGateway([]);
+      await using proc = spawnAgent(
+        gateway,
+        `const { Worker } = require("node:worker_threads");
+         const worker = new Worker(
+           "function workerSpin() { const end = Date.now() + 50; while (Date.now() < end) {} }" +
+           "setInterval(workerSpin, 60);",
+           { eval: true },
+         );
+         worker.on("online", () => console.log("online"));
+         for await (const line of console) {}
+         worker.terminate();`,
+      );
+      const nextLine = lineReader(proc.stdout);
+      expect(await nextLine()).toBe("online");
+      await gateway.command(profileCommand("r-main", 0, 600));
+      const main = assetOf(await gateway.next("ExportAsset"));
+      await gateway.command(profileCommand("r-worker", 1, 600));
+      const worker = assetOf(await gateway.next("ExportAsset"));
+
+      expect({ ...main, profile: undefined, duration: undefined, chunkSizes: undefined, text: undefined }).toEqual({
+        requestId: "r-main",
+        command: "profile",
+        threadId: 0,
+        error: undefined,
+        complete: true,
+        duration: undefined,
+        chunkSizes: undefined,
+        text: undefined,
+        profile: undefined,
+      });
+      expect(main.duration).toBeGreaterThanOrEqual(600);
+      // The main thread waits on stdin: nearly all of it is idle, sampled once
+      // a millisecond over the whole profile.
+      const { profile } = main;
+      const spanUs = profile.endTime - profile.startTime;
+      const sumUs = profile.timeDeltas.reduce((a: number, b: number) => a + b, 0);
+      expect(spanUs).toBeGreaterThanOrEqual(550_000);
+      expect(Math.abs(sumUs - spanUs)).toBeLessThan(5_000);
+      expect(profile.samples.length).toBeGreaterThan(spanUs / 1000 / 2);
+      expect(hitsOf(profile, "(idle)") / profile.samples.length).toBeGreaterThan(0.8);
+      expect(profile.nodes[0].callFrame.functionName).toBe("(root)");
+
+      expect({ requestId: worker.requestId, threadId: worker.threadId, complete: worker.complete }).toEqual({
+        requestId: "r-worker",
+        threadId: 1,
+        complete: true,
+      });
+      expect(functionsOf(worker.profile).has("workerSpin")).toBe(true);
+      expect(hitsOf(worker.profile, "workerSpin")).toBeGreaterThan(50);
+    });
+
+    test.concurrent("of a thread that is busy in JS", async () => {
+      await using gateway = await grpcGateway([]);
+      await using proc = spawnAgent(
+        gateway,
+        `function spin(ms) { const end = Date.now() + ms; while (Date.now() < end) {} }
+         for await (const line of console) { console.log("spinning"); spin(4000); console.log("done"); }`,
+      );
+      const nextLine = lineReader(proc.stdout);
+      await gateway.commandMetadata;
+      proc.stdin.write("go\n");
+      expect(await nextLine()).toBe("spinning");
+      await gateway.command(profileCommand("r-busy", 0, 500));
+      // The profile starts and stops while the thread is still spinning.
+      const busy = assetOf(await gateway.next("ExportAsset"));
+      const spinHits = hitsOf(busy.profile, "spin");
+      expect({ requestId: busy.requestId, complete: busy.complete, spun: spinHits > 100 }).toEqual({
+        requestId: "r-busy",
+        complete: true,
+        spun: true,
+      });
+      expect(busy.duration).toBeLessThan(3000);
+      expect(await nextLine()).toBe("done");
+    });
+
+    test.concurrent("with N|Solid's errors: in progress, thread gone, assets disabled", async () => {
+      await using gateway = await grpcGateway([]);
+      await using proc = spawnAgent(gateway, UNTIL_STDIN_CLOSES);
+      await gateway.command(profileCommand("r-first", 0, 1500));
+      await gateway.command(profileCommand("r-again", 0, 100));
+      await gateway.command(profileCommand("r-nobody", 7, 100));
+      const errors = [assetOf(await gateway.next("ExportAsset")), assetOf(await gateway.next("ExportAsset"))];
+      errors.sort((a, b) => a.requestId.localeCompare(b.requestId));
+      expect(errors.map(e => [e.requestId, e.threadId, e.error])).toEqual([
+        ["r-again", 0, { code: 409, message: "Operation already in progress(1001)" }],
+        ["r-nobody", 7, { code: 410, message: "Thread already gone(1002)" }],
+      ]);
+      expect(assetOf(await gateway.next("ExportAsset")).requestId).toBe("r-first");
+
+      await gateway.command({
+        requestId: "r-off",
+        id: "x",
+        command: "reconfigure",
+        args: { reconfigure: { assetsEnabled: false } },
+      });
+      await gateway.next("ExportReconfigure");
+      await gateway.command(profileCommand("r-disabled", 0, 100));
+      const disabled = assetOf(await gateway.next("ExportAsset"));
+      expect([disabled.requestId, disabled.error]).toEqual([
+        "r-disabled",
+        { code: 500, message: "Assets collection disabled(1008)" },
+      ]);
+    });
+
+    test.concurrent("refused while another profiler runs on the thread", async () => {
+      await using gateway = await grpcGateway([]);
+      using dir = tempDir("nsolid-cpu-prof", {});
+      await using proc = spawnAgent(gateway, UNTIL_STDIN_CLOSES, {}, ["--cpu-prof", `--cpu-prof-dir=${String(dir)}`]);
+      await gateway.command(profileCommand("r-taken", 0, 100));
+      const taken = assetOf(await gateway.next("ExportAsset"));
+      expect([taken.requestId, taken.error]).toEqual([
+        "r-taken",
+        { code: 409, message: "Operation already in progress(1001)" },
+      ]);
+    });
+
+    test.concurrent("cut short by the process's exit, which names it", async () => {
+      await using gateway = await grpcGateway([]);
+      await using proc = spawnAgent(gateway, `for await (const _ of console) {} process.exitCode = 4;`);
+      await gateway.command(profileCommand("r-exit", 0, 60_000));
+      // The idle main thread runs the profile's start long before the agent
+      // has answered a later command.
+      await gateway.command({ requestId: "r-info", id: "x", command: "info" });
+      await gateway.next("ExportInfo");
+      proc.stdin.end();
+      const asset = assetOf(await gateway.next("ExportAsset"));
+      const exit = await gateway.next("ExportExit");
+      expect({
+        requestId: asset.requestId,
+        complete: asset.complete,
+        profile: exit.body.profile,
+        code: exit.body.code,
+      }).toEqual({ requestId: "r-exit", complete: true, profile: "r-exit", code: 4 });
+      expect(await proc.exited).toBe(4);
+    });
+  });
+
+  describe("takes heap snapshots", () => {
+    const snapshotCommand = (requestId: string, threadId: number, redacted: boolean) => ({
+      requestId,
+      id: "x",
+      command: "snapshot",
+      args: { profile: { thread_id: threadId, duration: 10_000, heap_snapshot: { redacted } } },
+    });
+    // A V8 snapshot's nodes as { type, name, edges }, each edge as
+    // { type, name, to } with `to` a node index.
+    const graphOf = (snapshot: any) => {
+      const { node_fields, node_types, edge_fields, edge_types } = snapshot.snapshot.meta;
+      const node = (field: string) => node_fields.indexOf(field);
+      const edge = (field: string) => edge_fields.indexOf(field);
+      const nodes: { type: string; name: string; edges: { type: string; name: string | number; to: number }[] }[] = [];
+      let e = 0;
+      for (let i = 0; i < snapshot.nodes.length; i += node_fields.length) {
+        const edges = [];
+        for (let k = 0; k < snapshot.nodes[i + node("edge_count")]; k++, e += edge_fields.length) {
+          const type = edge_types[0][snapshot.edges[e + edge("type")]];
+          const nameOrIndex = snapshot.edges[e + edge("name_or_index")];
+          edges.push({
+            type,
+            name: type === "element" || type === "hidden" ? nameOrIndex : snapshot.strings[nameOrIndex],
+            to: snapshot.edges[e + edge("to_node")] / node_fields.length,
+          });
+        }
+        nodes.push({
+          type: node_types[0][snapshot.nodes[i + node("type")]],
+          name: snapshot.strings[snapshot.nodes[i + node("name")]],
+          edges,
+        });
+      }
+      return { nodes, edgesRead: e };
+    };
+    const plantedOf = (graph: ReturnType<typeof graphOf>, className: string) => {
+      const holder = graph.nodes.find(n => n.type === "object" && n.name === className);
+      const value = holder?.edges.find(edge => edge.type === "property" && edge.name === "value");
+      return value && { type: graph.nodes[value.to].type, name: graph.nodes[value.to].name };
+    };
+
+    test.concurrent("of a thread, in V8's format, and with no string's text when redacted", async () => {
+      await using gateway = await grpcGateway([]);
+      await using proc = spawnAgent(
+        gateway,
+        `class PlantedHolder { constructor(value) { this.value = value; } }
+         globalThis.holder = new PlantedHolder(crypto.randomUUID());
+         globalThis.many = Array.from({ length: 50_000 }, (_, i) => ({ i }));
+         console.log(globalThis.holder.value);
+         ${UNTIL_STDIN_CLOSES}`,
+      );
+      const planted = await lineReader(proc.stdout)();
+      await gateway.command(snapshotCommand("r-plain", 0, false));
+      const plain = assetOf(await gateway.next("ExportAsset"));
+      await gateway.command(snapshotCommand("r-redacted", 0, true));
+      const redacted = assetOf(await gateway.next("ExportAsset"));
+
+      expect([plain, redacted].map(a => [a.requestId, a.command, a.threadId, a.error, a.complete])).toEqual([
+        ["r-plain", "snapshot", 0, undefined, true],
+        ["r-redacted", "snapshot", 0, undefined, true],
+      ]);
+      expect(plantedOf(graphOf(plain.profile), "PlantedHolder")).toEqual({ type: "string", name: planted });
+      expect(plain.text).toContain(planted);
+
+      const snapshot = redacted.profile;
+      expect(redacted.text).not.toContain(planted);
+      expect(Object.keys(snapshot)).toEqual([
+        "snapshot",
+        "nodes",
+        "edges",
+        "trace_function_infos",
+        "trace_tree",
+        "samples",
+        "locations",
+        "strings",
+      ]);
+      const { node_count, edge_count, meta } = snapshot.snapshot;
+      const graph = graphOf(snapshot);
+      expect({
+        nodes: snapshot.nodes.length,
+        edges: snapshot.edges.length,
+        edgesRead: graph.edgesRead,
+        targets: graph.nodes.every(n => n.edges.every(edge => Number.isInteger(edge.to) && edge.to < node_count)),
+      }).toEqual({
+        nodes: node_count * meta.node_fields.length,
+        edges: edge_count * meta.edge_fields.length,
+        edgesRead: edge_count * meta.edge_fields.length,
+        targets: true,
+      });
+      const types = new Set(graph.nodes.map(n => n.type));
+      for (const type of ["synthetic", "object", "closure", "string", "code", "hidden", "object shape"]) {
+        expect(types).toContain(type);
+      }
+      expect(graph.nodes[0]).toMatchObject({ type: "synthetic", name: "" });
+      expect(new Set(graph.nodes.filter(n => n.type === "string").map(n => n.name))).toEqual(new Set(["(redacted)"]));
+      expect(plantedOf(graph, "PlantedHolder")).toEqual({ type: "string", name: "(redacted)" });
+      // In chunks of at most 1 MiB.
+      expect(redacted.chunkSizes.length).toBeGreaterThan(1);
+      expect(Math.max(...redacted.chunkSizes)).toBeLessThanOrEqual(1 << 20);
+    });
+
+    test.concurrent("of a worker's heap, not the main thread's", async () => {
+      await using gateway = await grpcGateway([]);
+      await using proc = spawnAgent(
+        gateway,
+        `const { Worker } = require("node:worker_threads");
+         const worker = new Worker(
+           "class WorkerHolder { constructor(value) { this.value = value; } }" +
+           "globalThis.holder = new WorkerHolder('w'); setInterval(() => {}, 1000);",
+           { eval: true },
+         );
+         worker.on("online", () => console.log("online"));
+         for await (const line of console) {}
+         worker.terminate();`,
+      );
+      expect(await lineReader(proc.stdout)()).toBe("online");
+      await gateway.command(snapshotCommand("r-worker", 1, true));
+      const asset = assetOf(await gateway.next("ExportAsset"));
+      const names = new Set(graphOf(asset.profile).nodes.map(n => n.name));
+      expect([asset.requestId, asset.threadId, asset.error, names.has("WorkerHolder")]).toEqual([
+        "r-worker",
+        1,
+        undefined,
+        true,
+      ]);
+    });
+
+    test.concurrent("with N|Solid's errors: in progress, thread gone, disabled", async () => {
+      await using gateway = await grpcGateway([]);
+      await using proc = spawnAgent(gateway, UNTIL_STDIN_CLOSES);
+      await gateway.command(snapshotCommand("r-first", 0, true));
+      await gateway.command(snapshotCommand("r-again", 0, true));
+      await gateway.command(snapshotCommand("r-nobody", 7, true));
+      const answers = [];
+      for (let i = 0; i < 3; i++) answers.push(assetOf(await gateway.next("ExportAsset")));
+      answers.sort((a, b) => a.requestId.localeCompare(b.requestId));
+      expect(answers.map(a => [a.requestId, a.threadId, a.error, a.complete])).toEqual([
+        ["r-again", 0, { code: 409, message: "Operation already in progress(1001)" }, false],
+        ["r-first", 0, undefined, true],
+        ["r-nobody", 7, { code: 410, message: "Thread already gone(1002)" }, false],
+      ]);
+
+      await using otherGateway = await grpcGateway([]);
+      await using disabled = spawnAgent(otherGateway, UNTIL_STDIN_CLOSES, { NSOLID_DISABLE_SNAPSHOTS: "1" });
+      await otherGateway.command(snapshotCommand("r-disabled", 0, true));
+      const refused = assetOf(await otherGateway.next("ExportAsset"));
+      expect([refused.requestId, refused.error]).toEqual([
+        "r-disabled",
+        { code: 500, message: "Heap Snapshots disabled(1004)" },
+      ]);
+    });
+  });
+
+  test.concurrent("reports blocked loops past the threshold, with the stack that blocked", async () => {
+    await using gateway = await grpcGateway([]);
+    const script = [
+      `const { Worker } = require("node:worker_threads");`,
+      `function spin(ms) { const end = Date.now() + ms; while (Date.now() < end) {} }`,
+      `function beforeReconfigure() { spin(600); }`,
+      `function briefly() { spin(100); }`,
+      `function blockFor() { spin(1500); }`,
+      `const worker = new Worker(`,
+      `  "function workerBlock() { const end = Date.now() + 1500; while (Date.now() < end) {} }\\n" +`,
+      `  "require('node:worker_threads').parentPort.on('message', () => workerBlock());",`,
+      `  { eval: true },`,
+      `);`,
+      `worker.on("online", () => console.log("online"));`,
+      `const actions = { beforeReconfigure, briefly, blockFor, worker: () => worker.postMessage("block") };`,
+      `for await (const line of console) { actions[line](); console.log("done " + line); }`,
+      `worker.terminate();`,
+    ].join("\n");
+    await using proc = spawnAgent(gateway, script, { NSOLID_BLOCKED_LOOP_THRESHOLD: "5000" });
+    const nextLine = lineReader(proc.stdout);
+    const run = async (action: string) => {
+      proc.stdin.write(action + "\n");
+      expect(await nextLine()).toBe("done " + action);
+    };
+    const summary = (event: any) => ({
+      command: event.common.command,
+      threadId: Number(event.body.thread_id),
+      frames: event.body.stack?.slice(0, 2).map((frame: any) => [frame.function_name, frame.line_number]),
+    });
+    expect(await nextLine()).toBe("online");
+
+    // Under the threshold: nothing, so the first event is the third block's.
+    await run("beforeReconfigure");
+    await gateway.command({
+      requestId: "r-threshold",
+      id: "x",
+      command: "reconfigure",
+      args: { reconfigure: { blockedLoopThreshold: 300 } },
+    });
+    await gateway.next("ExportReconfigure");
+    await run("briefly");
+    await run("blockFor");
+    const blocked = await gateway.next("ExportBlockedLoop");
+    const unblocked = await gateway.next("ExportUnblockedLoop");
+    expect([summary(blocked), summary(unblocked)]).toEqual([
+      {
+        command: "loop_blocked",
+        threadId: 0,
+        frames: [
+          ["spin", 2],
+          ["blockFor", 5],
+        ],
+      },
+      { command: "loop_unblocked", threadId: 0, frames: undefined },
+    ]);
+    const top = blocked.body.stack[0];
+    expect({
+      scriptName: top.script_name.includes("eval"),
+      isEval: top.is_eval,
+      column: top.column > 0,
+      scriptId: Number(top.script_id) > 0,
+      blockedFor: blocked.body.blocked_for >= 300 && blocked.body.blocked_for < 1500,
+      ranFor: unblocked.body.blocked_for >= 1500,
+      sameLoop: unblocked.body.loop_id === blocked.body.loop_id,
+    }).toEqual({
+      scriptName: true,
+      isEval: false,
+      column: true,
+      scriptId: true,
+      blockedFor: true,
+      ranFor: true,
+      sameLoop: true,
+    });
+
+    await run("worker");
+    const workerBlocked = await gateway.next("ExportBlockedLoop");
+    const workerUnblocked = await gateway.next("ExportUnblockedLoop");
+    expect([summary(workerBlocked), summary(workerUnblocked)]).toEqual([
+      {
+        command: "loop_blocked",
+        threadId: 1,
+        frames: [
+          ["workerBlock", 1],
+          ["", 2],
+        ],
+      },
+      { command: "loop_unblocked", threadId: 1, frames: undefined },
+    ]);
+  });
+
+  test.concurrent("reports a loop blocked outside JavaScript, with an empty stack", async () => {
+    await using gateway = await grpcGateway([]);
+    await using proc = spawnAgent(
+      gateway,
+      `for await (const line of console) { Bun.sleepSync(2500); console.log("done"); }`,
+      { NSOLID_BLOCKED_LOOP_THRESHOLD: "300" },
+    );
+    await gateway.commandMetadata;
+    proc.stdin.write("go\n");
+    const blocked = await gateway.next("ExportBlockedLoop");
+    const unblocked = await gateway.next("ExportUnblockedLoop");
+    expect({
+      threadId: Number(blocked.body.thread_id),
+      stack: blocked.body.stack ?? [],
+      ranFor: unblocked.body.blocked_for >= 2500,
+    }).toEqual({ threadId: 0, stack: [], ranFor: true });
   });
 
   test.concurrent("lists the packages the main script can require, and marks the ones it loaded", async () => {
@@ -635,14 +1195,19 @@ describe("N|Solid agent", () => {
   });
 
   describe("reports the process's exit", () => {
-    const exitOf = async (script: string, end: (proc: Bun.Subprocess) => void) => {
+    const exitOf = async (
+      script: string,
+      end: (proc: Bun.Subprocess) => void,
+      extraEnv: Record<string, string> = {},
+      args: string[] = [],
+    ) => {
       await using gateway = await grpcGateway([{ requestId: "r-info", id: "x", command: "info" }]);
       await using proc = Bun.spawn({
-        cmd: [bunExe(), "-e", script],
+        cmd: [bunExe(), "-e", script, ...args],
         stdin: "pipe",
         stdout: "ignore",
         stderr: "ignore",
-        env: { ...bunEnv, NSOLID_GRPC: `127.0.0.1:${gateway.port}`, NSOLID_GRPC_INSECURE: "1" },
+        env: { ...bunEnv, NSOLID_GRPC: `127.0.0.1:${gateway.port}`, NSOLID_GRPC_INSECURE: "1", ...extraEnv },
       });
       // Answering `info` means the agent is connected.
       await gateway.next("ExportInfo");
@@ -715,6 +1280,27 @@ describe("N|Solid agent", () => {
         });
       });
     }
+
+    test.concurrent.each([
+      ["segfault", 11, "SIGSEGV", "Segmentation fault at address 0xDEADBEEF"],
+      ["panic", 6, "SIGABRT", "invoked crashByPanic() handler"],
+    ])("with the crash that ends it: %s", async (crash, code, signal, message) => {
+      const exit = await exitOf(
+        `const { crash_handler } = require("bun:internal-for-testing");
+         for await (const line of console) crash_handler[line]();`,
+        proc => proc.stdin!.write(crash + "\n"),
+        { BUN_FEATURE_FLAG_INTERNAL_FOR_TESTING: "1", BUN_ENABLE_CRASH_REPORTING: "0" },
+        // A debug build symbolizes the trace for seconds instead.
+        ["--debug-crash-handler-use-trace-string"],
+      );
+      expect({
+        code: exit.code,
+        signal: exit.signal,
+        message: exit.error?.message,
+        trace: typeof exit.error?.stack,
+        signalCode: exit.signalCode,
+      }).toEqual({ code, signal, message, trace: "string", signalCode: signal });
+    });
   });
 
   test.concurrent("reads its configuration with N|Solid's precedence and validation", async () => {
@@ -1077,6 +1663,73 @@ describe("N|Solid agent", () => {
       expect(JSON.parse(await nextLine())).toEqual({ interval: 7000, app: "renamed" });
     },
   );
+
+  test.concurrent("nsolid.profile(), profileEnd() and snapshot() send assets the way N|Solid marks them", async () => {
+    await using gateway = await grpcGateway([]);
+    await using proc = spawnAgent(
+      gateway,
+      `const nsolid = require("nsolid");
+       const answer = (name) => (err) => console.log(name + " " + (err ? err.code + " " + err.message : "ok"));
+       for await (const line of console) {
+         if (line === "profile") nsolid.profile(60_000, answer("profile"));
+         if (line === "end") nsolid.profileEnd(answer("end"));
+         if (line === "snapshot") nsolid.snapshot(answer("snapshot"));
+         if (line === "heap") nsolid.heapProfile(answer("heap"));
+         if (line === "off") { nsolid.disableAssets(); console.log("off " + nsolid.assetsEnabled); }
+         if (line === "refused") { try { nsolid.snapshot(); } catch (err) { console.log("refused " + err.code); } }
+       }`,
+    );
+    const nextLine = lineReader(proc.stdout);
+    const ask = async (line: string) => {
+      proc.stdin.write(line + "\n");
+      return nextLine();
+    };
+    const marked = (messages: any[]) => JSON.stringify(messages[0].metadata).includes("Agent API");
+    await gateway.commandMetadata;
+
+    expect(await ask("profile")).toBe("profile ok");
+    // The profile starts once the agent has asked the thread to start it.
+    let ended: string;
+    while ((ended = await ask("end")) !== "end ok") expect(ended).toBe("end 404 CPU profile could not be stopped");
+    const profile = await gateway.next("ExportAsset");
+    expect(await ask("snapshot")).toBe("snapshot ok");
+    const snapshot = await gateway.next("ExportAsset");
+    expect(
+      [profile, snapshot].map(m => [assetOf(m).command, assetOf(m).threadId, assetOf(m).complete, marked(m)]),
+    ).toEqual([
+      ["profile", 0, true, true],
+      ["snapshot", 0, true, true],
+    ]);
+    expect(assetOf(profile).profile.nodes[0].callFrame.functionName).toBe("(root)");
+    expect(assetOf(snapshot).profile.snapshot.node_count).toBeGreaterThan(0);
+
+    expect(await ask("heap")).toBe("heap 404 Heap profile could not be started");
+    expect(await ask("off")).toBe("off false");
+    expect(await ask("refused")).toBe("refused 500");
+  });
+
+  test.concurrent("nsolid's profiles and snapshots are not available without an agent", async () => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const nsolid = require("nsolid");
+         const calls = [() => nsolid.profile(), () => nsolid.profileEnd(), () => nsolid.snapshot(), () => nsolid.heapSampling()];
+         console.log(JSON.stringify(calls.map(call => { try { call(); return "ok"; } catch (err) { return [err.code, err.message]; } })));`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "inherit",
+    });
+    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+    expect(JSON.parse(stdout)).toEqual([
+      [404, "CPU profile could not be started"],
+      [404, "CPU profile could not be stopped"],
+      [404, "Heap snapshot could not be generated"],
+      [404, "Heap sampling could not be started"],
+    ]);
+    expect(exitCode).toBe(0);
+  });
 
   test.concurrent("nsolid and bun:nsolid are the same module, with the process's id", async () => {
     await using proc = Bun.spawn({

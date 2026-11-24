@@ -4,6 +4,22 @@ import "common.proto";
 
 package grpcagent;
 
+// What runs the process: the runtime, its JavaScript engine and the agent's
+// own build, as proposed with the N|Solid Console; N|Solid's own protos don't
+// have it yet. An agent without it is N|Solid for Node.js.
+message RuntimeInfo {
+  string name = 1;           // "node" or "bun"
+  string version = 2;        // the runtime's own version: 26.12.1 for Node.js, 1.4.6 for Bun
+  string engine = 3;         // "v8" or "jsc"
+  string agent_version = 4;  // the agent's build: 6.3.11 for N|Solid, 0.1.0 for nsolid-bun
+}
+
+// What the agent can do. An agent without it can do what N|Solid can.
+message Capabilities {
+  repeated string commands = 1;  // command names the agent answers
+  repeated string settings = 2;  // ReconfigureBody keys the agent applies
+}
+
 message InfoBody {
   string app = 1;
   string arch = 2;
@@ -22,6 +38,8 @@ message InfoBody {
   map<string, string> versions = 15;
   uint32 kernelVersion = 16;
   optional string appVersion = 17;
+  optional RuntimeInfo runtime = 18;
+  optional Capabilities capabilities = 19;
 }
 
 message InfoEvent {
