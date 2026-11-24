@@ -41,6 +41,7 @@ const { validateInteger, validateBoolean, validateString, validateOneOf } = requ
 const { getTimerDuration } = require("internal/timers");
 const { addAbortSignal } = require("internal/streams/add-abort-signal");
 const finished = require("internal/streams/end-of-stream");
+const nsolidHooks = require("internal/nsolid/hooks");
 
 const ObjectAssign = Object.assign;
 const ObjectDefineProperty = Object.defineProperty;
@@ -696,6 +697,7 @@ function socketCloseListenerInner(this: $Node.HttpClientSocket) {
   // Socket-level close without a response (connection reset, abort):
   // close the trace span so it doesn't stay open forever.
   traceClientResponseEnd(req);
+  nsolidHooks.httpClientResponseEnd?.(req);
   if (res) {
     // Socket closed before we emitted 'end' below.
     if (!res.complete) {
@@ -1043,6 +1045,7 @@ function responseKeepAlive(req: $Node.ClientRequest) {
 function responseOnEnd(this: $Node.IncomingMessage) {
   const req = this.req!;
   const socket = req.socket;
+  nsolidHooks.httpClientResponseEnd?.(req);
 
   if (socket) {
     if (req.timeoutCb) socket.removeListener("timeout", emitRequestTimeout);
@@ -1209,6 +1212,7 @@ function destroyRequestOnSocketNT(
   // The request is dead with no parser: close the trace span on the paths
   // that skip emitErrorEvent above (proxy tunnel; error already emitted).
   traceClientResponseEnd(req);
+  nsolidHooks.httpClientResponseEnd?.(req);
   closeRequest(req);
 }
 

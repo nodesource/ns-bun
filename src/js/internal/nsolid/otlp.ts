@@ -72,9 +72,45 @@ const loopAndGcMetrics: [string, Kind, string, ValueType][] = [
   ["loopAvgTasks", "gauge", "", "double"],
   ["loopEstimatedLag", "gauge", "ms", "double"],
   ["loopIdlePercent", "gauge", "", "double"],
+  ["dnsCount", "counter", "", "int"],
+  ["httpClientAbortCount", "counter", "", "int"],
+  ["httpClientCount", "counter", "", "int"],
+  ["httpServerAbortCount", "counter", "", "int"],
+  ["httpServerCount", "counter", "", "int"],
+  ["activeHandles", "gauge", "", "int"],
+  ["activeRequests", "gauge", "", "int"],
+  ["tcpServerCreatedCount", "counter", "", "int"],
+  ["tcpServerDestroyedCount", "counter", "", "int"],
+  ["tcpSocketCreatedCount", "counter", "", "int"],
+  ["tcpSocketDestroyedCount", "counter", "", "int"],
+  ["udpSocketCreatedCount", "counter", "", "int"],
+  ["udpSocketDestroyedCount", "counter", "", "int"],
+  ["pipeServerCreatedCount", "counter", "", "int"],
+  ["pipeServerDestroyedCount", "counter", "", "int"],
+  ["pipeSocketCreatedCount", "counter", "", "int"],
+  ["pipeSocketDestroyedCount", "counter", "", "int"],
+  ["fsHandlesOpenedCount", "counter", "", "int"],
+  ["fsHandlesClosedCount", "counter", "", "int"],
 ];
 
+// The thread summaries N|Solid sends, as [name, unit, the figure its median is in, its 99th percentile's].
+const summaries: [string, string, string, string][] = [
+  ["gcDurUs", "us", "gcDurUsMedian", "gcDurUs99Ptile"],
+  ["dns", "ms", "dnsMedian", "dns99Ptile"],
+  ["httpClient", "ms", "httpClientMedian", "httpClient99Ptile"],
+  ["httpServer", "ms", "httpServerMedian", "httpServer99Ptile"],
+];
+// What N|Solid's exporter keeps of a span: opentelemetry-cpp's default limit.
+const MAX_SPAN_ATTRIBUTES = 128;
+const SEVERITY_TEXT: Record<number, string> = { 5: "DEBUG", 9: "INFO", 13: "WARN", 17: "ERROR", 21: "FATAL" };
+
 const nanos = (ms: number) => BigInt(Math.round(ms)) * 1_000_000n;
+
+// Epoch milliseconds with a fraction, to the nanosecond: a double can't hold the product.
+function preciseNanos(ms: number): bigint {
+  const whole = Math.floor(ms);
+  return BigInt(whole) * 1_000_000n + BigInt(Math.round((ms - whole) * 1e6));
+}
 
 function attribute(key: string, value: string | number) {
   return {
@@ -173,20 +209,145 @@ function resourceMetrics(identity: Identity, proc: Record<string, any>, threads:
     if (points.length) metrics.push(metric(name, kind, unit, points));
   }
   if (withLoop.length) {
-    const points = withLoop.map(thread => ({
-      start_time_unix_nano: nanos(start),
-      time_unix_nano: nanos(thread.timestamp),
-      count: 0n,
-      sum: 0,
-      quantile_values: [
-        { quantile: 0.5, value: thread.gcDurUsMedian },
-        { quantile: 0.99, value: thread.gcDurUs99Ptile },
-      ],
-      attributes: threadAttributes(thread),
-    }));
-    metrics.push({ name: "gcDurUs", unit: "us", summary: { data_points: points } });
+    for (const [name, unit, median, p99] of summaries) {
+      const points = withLoop.map(thread => ({
+        start_time_unix_nano: nanos(start),
+        time_unix_nano: nanos(thread.timestamp),
+        count: 0n,
+        sum: 0,
+        quantile_values: [
+          { quantile: 0.5, value: thread[median] },
+          { quantile: 0.99, value: thread[p99] },
+        ],
+        attributes: threadAttributes(thread),
+      }));
+      metrics.push({ name, unit, summary: { data_points: points } });
+    }
   }
   return { resource: resource(identity), scope_metrics: [{ scope: SCOPE, metrics }] };
 }
 
-export default { resourceMetrics };
+// An attribute's value as N|Solid's exporter keeps it: a string, a boolean, a number, or an array of one of those.
+// Anything else (objects, mixed or nested arrays, empty arrays) is left out.
+function anyValue(value: unknown): object | undefined {
+  switch (typeof value) {
+    case "string":
+      return { string_value: value };
+    case "boolean":
+      return { bool_value: value };
+    case "number":
+      return Number.isSafeInteger(value) ? { int_value: value } : { double_value: value };
+  }
+  if (!$isArray(value) || value.length === 0) return undefined;
+  const type = typeof value[0];
+  if (type !== "string" && type !== "boolean" && type !== "number") return undefined;
+  for (const element of value) if (typeof element !== type) return undefined;
+  if (type === "number" && !value.every(element => Number.isSafeInteger(element))) {
+    return { array_value: { values: value.map(element => ({ double_value: element })) } };
+  }
+  return { array_value: { values: value.map(anyValue) } };
+}
+
+function keyValues(attributes: Record<string, unknown> | undefined, limit = Infinity) {
+  const list: object[] = [];
+  let dropped = 0;
+  if (attributes) {
+    for (const key of Object.keys(attributes)) {
+      const value = anyValue(attributes[key]);
+      if (!value) continue;
+      if (list.length < limit) list.push({ key, value });
+      else dropped++;
+    }
+  }
+  return { list, dropped };
+}
+
+const bytesOf = (hex: string) => Buffer.from(hex, "hex");
+
+export interface EndedSpan {
+  traceId: string;
+  spanId: string;
+  parentSpanId: string;
+  name: string;
+  kind: number;
+  type: number;
+  start: number;
+  end: number;
+  attributes: Record<string, unknown>;
+  events: { name: string; time: number; attributes?: Record<string, unknown> }[];
+  links: { traceId: string; spanId: string; attributes?: Record<string, unknown> }[];
+  status?: { code: number; message?: string };
+  threadId: number;
+}
+
+// A span as N|Solid's exporter sends it, with its thread and N|Solid's span type last. A thread's name is sent
+// only when it has one.
+function span(ended: EndedSpan, threadName: string) {
+  const { list: attributes, dropped } = keyValues(ended.attributes, MAX_SPAN_ATTRIBUTES - 3);
+  if (threadName) attributes.push(attribute("thread.name", threadName));
+  attributes.push(attribute("thread.id", ended.threadId), attribute("nsolid.span_type", ended.type));
+  return {
+    trace_id: bytesOf(ended.traceId),
+    span_id: bytesOf(ended.spanId),
+    parent_span_id: ended.parentSpanId ? bytesOf(ended.parentSpanId) : undefined,
+    name: ended.name,
+    kind: ended.kind,
+    start_time_unix_nano: preciseNanos(ended.start),
+    end_time_unix_nano: preciseNanos(ended.end),
+    attributes,
+    dropped_attributes_count: dropped || undefined,
+    events: ended.events.map(event => ({
+      time_unix_nano: preciseNanos(event.time),
+      name: event.name,
+      attributes: keyValues(event.attributes).list,
+    })),
+    links: ended.links.map(link => ({
+      trace_id: bytesOf(link.traceId),
+      span_id: bytesOf(link.spanId),
+      attributes: keyValues(link.attributes).list,
+    })),
+    status: ended.status,
+  };
+}
+
+function tracesRequest(identity: Identity, spans: object[]) {
+  return { resource_spans: [{ resource: resource(identity), scope_spans: [{ scope: SCOPE, spans }] }] };
+}
+
+export interface QueuedLog {
+  body: string;
+  severity: number;
+  time: string;
+  traceId: string;
+  spanId: string;
+  traceFlags: number;
+}
+
+// A `nsolid.logger` line as N|Solid sends it: the body as a string, and the span it was written in, if any.
+function logRecord(log: QueuedLog) {
+  const time = BigInt(log.time);
+  const record: Record<string, unknown> = {
+    time_unix_nano: time,
+    observed_time_unix_nano: time,
+    severity_number: log.severity,
+    severity_text: SEVERITY_TEXT[log.severity],
+    body: { string_value: log.body },
+  };
+  const { traceId, spanId } = log;
+  if (traceId && spanId) {
+    record.trace_id = bytesOf(traceId);
+    record.span_id = bytesOf(spanId);
+    record.flags = log.traceFlags;
+  }
+  return record;
+}
+
+// N|Solid's log resource is the small one: the app, the agent, the app's version.
+function logsRequest(identity: Identity, records: object[]) {
+  const attributes = [attribute("service.name", identity.app), attribute("service.instance.id", identity.agentId)];
+  const { appVersion } = identity;
+  if (appVersion) attributes.push(attribute("service.version", appVersion));
+  return { resource_logs: [{ resource: { attributes }, scope_logs: [{ scope: SCOPE, log_records: records }] }] };
+}
+
+export default { resourceMetrics, span, tracesRequest, logRecord, logsRequest };

@@ -22,6 +22,7 @@ const processStart = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidProcess
 const loadedModules = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidLoadedModules", 0);
 const apiCommand = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidApiCommand", 2);
 const apiProfileEnd = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidApiProfileEnd", 0);
+const writeLog = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidWriteLog", 5);
 
 const DEFAULT_APPNAME = "untitled application";
 // What a profile from code runs for at most, as in N|Solid.
@@ -230,9 +231,34 @@ function packages(callback?: (err: null, packages: object[]) => void) {
   return maybeCallback(inventory.packagesAtOnce(loadedModules()).slice(), callback);
 }
 
+// `nsolid.logger`: a line for the Console's logs, in the span active where it is written, as N|Solid sends it. A
+// value that isn't a string is sent as JSON. Lines go nowhere while no agent runs.
+function log(message: unknown, severity: number) {
+  const body = typeof message === "string" ? message : (JSON.stringify(message) ?? "undefined");
+  const span = require("internal/nsolid/otel").activeSpanContext();
+  writeLog(body, severity, span?.traceId ?? "", span?.spanId ?? "", (span?.traceFlags ?? 0) & 0xff);
+}
+
+const logger = {
+  debug: (message: unknown) => log(message, 5),
+  info: (message: unknown) => log(message, 9),
+  warn: (message: unknown) => log(message, 13),
+  error: (message: unknown) => log(message, 17),
+  fatal: (message: unknown) => log(message, 21),
+};
+
+// `nsolid.otel`: see internal/nsolid/otel.ts.
+const otel = {
+  register: (api: object) => require("internal/nsolid/otel").register(api),
+  registerInstrumentations: (instrumentations: object | object[]) =>
+    require("internal/nsolid/otel").registerInstrumentations(instrumentations),
+};
+
 Object.assign(start, {
   start,
   id,
+  logger,
+  otel,
   info,
   metrics,
   packages,

@@ -784,6 +784,10 @@ function link(name: ChannelName) {
     case "undici:websocket:pong":
       setHook("undici:websocket", require("internal/undici_channels").webSocketHook());
       break;
+    case "bun:serve:request:start":
+    case "bun:serve:request:end":
+      setHook("bun:serve:request", require("internal/serve_channels").serveHook());
+      break;
   }
 }
 

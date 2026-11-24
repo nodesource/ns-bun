@@ -6,6 +6,7 @@
 const EventEmitter = require("node:events");
 const { Stream } = require("node:stream");
 const { Stream: StreamOfLibrary } = require("internal/streams/legacy");
+const nsolidHooks = require("internal/nsolid/hooks");
 const StreamPrototype = Stream.prototype;
 // A name read from `plainStream` is looked up from Stream.prototype on. No constructor runs: the other text makes no stream here.
 function PlainStream() {}
@@ -120,6 +121,7 @@ const optionsSymbol: typeof http.optionsSymbol = http.optionsSymbol;
 const kPendingCallbacks: typeof http.kPendingCallbacks = http.kPendingCallbacks;
 const headerStateSymbol: typeof http.headerStateSymbol = http.headerStateSymbol;
 const fakeSocketSymbol: typeof http.fakeSocketSymbol = http.fakeSocketSymbol;
+const kHeaderSource: typeof http.kHeaderSource = http.kHeaderSource;
 const kChunkedEncoding = Symbol("kChunkedEncoding");
 const kShouldKeepAlive = Symbol("kShouldKeepAlive");
 const kMustCloseConnection = Symbol("kMustCloseConnection");
@@ -348,6 +350,11 @@ function assignSocketInternal(self: $Node.ServerResponse, socket: $Node.HttpServ
   setCloseCallback(socket, onServerResponseClose);
   self.socket = socket;
   self.emit("socket", socket);
+}
+
+// For the N|Solid agent: a request's headers from what the native handle captured, which `req.headers` reads later.
+function headersOfRequest(req: $Node.IncomingMessage) {
+  return req[kHeaderSource]?.headersObject();
 }
 
 const onServerResponseClose = function onServerResponseClose(this: $Node.HttpSocket) {
@@ -1597,6 +1604,8 @@ Server.prototype[kRealListen] = function (
         http_res.writeHead(400, { Connection: "close" });
         http_res.end();
       } else {
+        // The N|Solid agent's span of the request is the active one while the listeners run.
+        const nsolidScope = nsolidHooks.httpServerRequest?.(http_req, http_res, headersOfRequest);
         // Native code ends the response of a dispatch that throws. What the listener has written goes out first.
         try {
           if (isHttp11 && (dispatchBits & DispatchBits.has_expect) !== 0) {
@@ -1622,6 +1631,8 @@ Server.prototype[kRealListen] = function (
         } catch (error) {
           sendWhatIsHeld(http_res);
           throw error;
+        } finally {
+          nsolidScope?.[Symbol.dispose]();
         }
       }
 
@@ -1841,6 +1852,7 @@ function onNodeHTTPRequest(
   if (asksRequest) isOfHttp11(req);
   void server.requireHostHeader;
 
+  const nsolidScope = nsolidHooks.httpServerRequest?.(req, res, headersOfRequest);
   try {
     const listener = server.$requestListener;
     // Read once: an accessor may give another function at the next read.
@@ -1853,6 +1865,8 @@ function onNodeHTTPRequest(
   } catch (error) {
     if ((exchange.flags & ExchangeFlags.holds_chunk) !== 0) sendHeldChunk(res, exchange);
     throw error;
+  } finally {
+    nsolidScope?.[Symbol.dispose]();
   }
 
   if (!hasBody) req.complete = true;
@@ -5505,8 +5519,10 @@ const finishHeardExchange = function emitResponseFinished(
   }
 };
 
+// The N|Solid agent hears a response's 'finish' and 'close' in its emit, so they are emitted while it runs.
 function emitsUnseen(res: $Node.ServerResponse): boolean {
   return (
+    nsolidHooks.httpServerResponseEnd === undefined &&
     ((IS_COMPILED_AHEAD_OF_TIME && $findsDeclaredMember(res, "emit")) || res.emit === responseEmit) &&
     StreamPrototype.emit === eventEmitterEmit
   );
@@ -6791,8 +6807,15 @@ const responseEmit = (ServerResponse.prototype.emit = function (this: $Node.Serv
     }
     settleDispatchAtClose(this);
   }
+  if (event === "finish" || event === "close")
+    nsolidHooks.httpServerResponseEnd?.(this, event === "close", headersSent);
   return plainStream.emit.$apply(this, arguments);
 });
+
+// For the N|Solid agent, of a response it saw begin.
+function headersSent(res: $Node.ServerResponse) {
+  return res[headerStateSymbol] === NodeHTTPHeaderState.sent;
+}
 
 function emitResponseFinishedThenClose(res: $Node.ServerResponse, callback: $Node.HttpWriteCallback | null) {
   emitResponseFinished(res, callback);

@@ -94,10 +94,12 @@ function parseContCpuProfileInterval(value: unknown): number | undefined {
   return n;
 }
 
+// The span types a list of module names turns off. N|Solid adds the names' bits, so a name given twice turns off
+// other types; here a name counts once.
 function parseTracingModules(value: unknown): number {
   const list = typeof value === "string" ? value.split(",") : Array.isArray(value) ? value : [];
   let mask = 0;
-  for (const name of list) mask += TRACING_MODULES[String(name).trim()] || 0;
+  for (const name of list) mask |= TRACING_MODULES[String(name).trim()] || 0;
   return mask;
 }
 
@@ -279,6 +281,9 @@ function applyUpdate(config: Config, update: Record<string, any> | undefined) {
         break;
       case "contCpuProfile":
         config.contCpuProfile = envToBool(value);
+        break;
+      // Source reads are the Console's to turn on.
+      case "sourceCodeEnabled":
         break;
       case "contCpuProfileInterval":
       case "interval":

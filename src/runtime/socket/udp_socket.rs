@@ -73,6 +73,7 @@ use bun_sys::net::Address;
 
 extern "C" fn on_close(socket: *mut uws::udp::Socket) {
     let this: &UDPSocket = UDPSocket::from_uws(socket);
+    bun_jsc::nsolid_agent::count_handle(bun_jsc::nsolid_agent::Handle::UdpSocket, false);
     this.abort_handle.leave();
     this.poll_ref.disable();
     this.this_value.with_mut(|r| r.downgrade());
@@ -658,6 +659,7 @@ impl UDPSocket {
 
             return Err(cx.global().throw(format_args!("Failed to bind socket")));
         };
+        bun_jsc::nsolid_agent::count_handle(bun_jsc::nsolid_agent::Handle::UdpSocket, true);
 
         // Register this socket's live descriptor (adopted or freshly created)
         // so a later adoption of the same number fails with EEXIST; a wrap

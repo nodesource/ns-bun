@@ -6,6 +6,7 @@
 #include "MimallocWTFMalloc.h"
 
 #include "ZigGlobalObject.h"
+#include "NSolidAgent.h"
 #include "wtf/Assertions.h"
 
 #include <JavaScriptCore/Completion.h>
@@ -147,6 +148,9 @@ Ref<SourceProvider> SourceProvider::create(
         BunString str = Bun::toString(provider->sourceURL());
         Bun__addSourceProviderSourceMap(globalObject->bunVM(), provider.ptr(), &str);
     }
+
+    if (!isBuiltin)
+        Bun::nsolidNoteScript(provider.get(), sourceType == JSC::SourceProviderSourceType::Module || sourceType == JSC::SourceProviderSourceType::BunTranspiledModule);
 
     return provider;
 }

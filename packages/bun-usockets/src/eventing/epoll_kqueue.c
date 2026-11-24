@@ -530,6 +530,7 @@ void us_loop_run_bun_tick(struct us_loop_t *loop, const struct timespec* timeout
     if (timing) {
         const uint64_t poll_now_ns = us_loop_timing_now_ns();
         if (loop->data.tick_depth == 1) {
+            __atomic_store_n(&timing->active, loop->bun_polls, __ATOMIC_RELAXED);
             if (us_loop_iteration_hook)
                 us_loop_iteration_hook(timing, poll_now_ns);
             __atomic_store_n(&timing->iterations, timing->iterations + 1, __ATOMIC_RELAXED);

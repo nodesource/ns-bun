@@ -57,6 +57,22 @@ JSC_DECLARE_HOST_FUNCTION(jsFunctionNSolidSharedConfig);
 JSC_DECLARE_HOST_FUNCTION(jsFunctionNSolidOnStart);
 JSC_DECLARE_HOST_FUNCTION(jsFunctionNSolidStart);
 
+// Tracing: the agent sets the trace flags and sample rate of every thread;
+// threads queue their ended spans and their `nsolid.logger` lines, which the
+// agent takes; and threads record their HTTP and DNS figures.
+JSC_DECLARE_HOST_FUNCTION(jsFunctionNSolidSetTracing);
+JSC_DECLARE_HOST_FUNCTION(jsFunctionNSolidSendSpan);
+JSC_DECLARE_HOST_FUNCTION(jsFunctionNSolidWriteLog);
+JSC_DECLARE_HOST_FUNCTION(jsFunctionNSolidTakeSpans);
+JSC_DECLARE_HOST_FUNCTION(jsFunctionNSolidTakeLogs);
+JSC_DECLARE_HOST_FUNCTION(jsFunctionNSolidRecord);
+
+// `source_code`: each script a watched thread loads is noted (from
+// Zig::SourceProvider::create), and the agent looks one up by
+// (contextId, scriptId).
+void nsolidNoteScript(JSC::SourceProvider&, bool isEsm);
+JSC_DECLARE_HOST_FUNCTION(jsFunctionNSolidScript);
+
 // For `nsolid`: when the process started (ms since the epoch), and the
 // modules the calling thread loaded.
 JSC_DECLARE_HOST_FUNCTION(jsFunctionNSolidProcessStart);

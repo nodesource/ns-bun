@@ -2,6 +2,7 @@
 const dns = Bun.dns;
 const utilPromisifyCustomSymbol = Symbol.for("nodejs.util.promisify.custom");
 const { isIP } = require("internal/net/isIP");
+const nsolidHooks = require("internal/nsolid/hooks");
 const { guardCallback } = require("internal/shared");
 const {
   validateFunction,
@@ -71,6 +72,12 @@ interface DNSException extends Error {
 const IANA_DNS_PORT = 53;
 const IPv6RE = /^\[([^[\]]*)\]/;
 const addrSplitRE = /(^.+?)(?::(\d+))?$/;
+
+// The resolver a query goes to: the N|Solid agent, when it runs, traces queries on their way (internal/nsolid/tracing.ts).
+function traced<T extends object>(resolver: T): T {
+  const dnsResolver = nsolidHooks.dnsResolver;
+  return dnsResolver === undefined ? resolver : dnsResolver(resolver);
+}
 
 function translateErrorCode(promise: Promise<any>) {
   return promise.catch(error => {
@@ -403,7 +410,7 @@ function lookup(
   }
 
   callback = guardCallback(callback!);
-  (dns.lookup(hostname, options) as Promise<LookupAddress[]>)
+  (traced(dns).lookup(hostname, options) as Promise<LookupAddress[]>)
     .then(res => {
       throwIfEmpty(res);
       sortByOrder(res, (options as LookupOptions).order);
@@ -443,7 +450,9 @@ function lookupService(
   validatePort(port, "port");
   callback = validateCallback(callback);
 
-  (dns.lookupService(address, +port) as Promise<[hostname: string | undefined, service: string | undefined]>).then(
+  (
+    traced(dns).lookupService(address, +port) as Promise<[hostname: string | undefined, service: string | undefined]>
+  ).then(
     results => {
       callback(null, ...results);
     },
@@ -490,7 +499,7 @@ class Resolver {
 
     callback = validateResolve(hostname, callback);
 
-    const promise = Resolver.#getResolver(this).resolve(hostname, rrtype);
+    const promise = traced(Resolver.#getResolver(this)).resolve(hostname, rrtype);
     if (isAddressType(rrtype)) {
       deliverAddresses(promise, callback);
     } else {
@@ -505,7 +514,7 @@ class Resolver {
     }
 
     callback = validateResolve(hostname, callback);
-    deliverAddresses(Resolver.#getResolver(this).resolve(hostname, "A"), callback, options);
+    deliverAddresses(traced(Resolver.#getResolver(this)).resolve(hostname, "A"), callback, options);
   }
 
   resolve6(this: object | undefined, hostname: string, options?, callback?: ResolveCallback) {
@@ -515,62 +524,62 @@ class Resolver {
     }
 
     callback = validateResolve(hostname, callback);
-    deliverAddresses(Resolver.#getResolver(this).resolve(hostname, "AAAA"), callback, options);
+    deliverAddresses(traced(Resolver.#getResolver(this)).resolve(hostname, "AAAA"), callback, options);
   }
 
   resolveAny(this: object | undefined, hostname: string, callback: ResolveCallback) {
     callback = validateResolve(hostname, arguments.length > 2 ? arguments[2] : callback);
-    deliver(Resolver.#getResolver(this).resolveAny(hostname), callback);
+    deliver(traced(Resolver.#getResolver(this)).resolveAny(hostname), callback);
   }
 
   resolveCname(this: object | undefined, hostname: string, callback: ResolveCallback) {
     callback = validateResolve(hostname, arguments.length > 2 ? arguments[2] : callback);
-    deliver(Resolver.#getResolver(this).resolveCname(hostname), callback);
+    deliver(traced(Resolver.#getResolver(this)).resolveCname(hostname), callback);
   }
 
   resolveMx(this: object | undefined, hostname: string, callback: ResolveCallback) {
     callback = validateResolve(hostname, arguments.length > 2 ? arguments[2] : callback);
-    deliver(Resolver.#getResolver(this).resolveMx(hostname), callback);
+    deliver(traced(Resolver.#getResolver(this)).resolveMx(hostname), callback);
   }
 
   resolveNaptr(this: object | undefined, hostname: string, callback: ResolveCallback) {
     callback = validateResolve(hostname, arguments.length > 2 ? arguments[2] : callback);
-    deliver(Resolver.#getResolver(this).resolveNaptr(hostname), callback);
+    deliver(traced(Resolver.#getResolver(this)).resolveNaptr(hostname), callback);
   }
 
   resolveNs(this: object | undefined, hostname: string, callback: ResolveCallback) {
     callback = validateResolve(hostname, arguments.length > 2 ? arguments[2] : callback);
-    deliver(Resolver.#getResolver(this).resolveNs(hostname), callback);
+    deliver(traced(Resolver.#getResolver(this)).resolveNs(hostname), callback);
   }
 
   resolvePtr(this: object | undefined, hostname: string, callback: ResolveCallback) {
     callback = validateResolve(hostname, arguments.length > 2 ? arguments[2] : callback);
-    deliver(Resolver.#getResolver(this).resolvePtr(hostname), callback);
+    deliver(traced(Resolver.#getResolver(this)).resolvePtr(hostname), callback);
   }
 
   resolveSrv(this: object | undefined, hostname: string, callback: ResolveCallback) {
     callback = validateResolve(hostname, arguments.length > 2 ? arguments[2] : callback);
-    deliver(Resolver.#getResolver(this).resolveSrv(hostname), callback);
+    deliver(traced(Resolver.#getResolver(this)).resolveSrv(hostname), callback);
   }
 
   resolveCaa(this: object | undefined, hostname: string, callback: ResolveCallback) {
     callback = validateCallback(arguments.length > 2 ? arguments[2] : callback);
-    deliver(Resolver.#getResolver(this).resolveCaa(hostname), callback);
+    deliver(traced(Resolver.#getResolver(this)).resolveCaa(hostname), callback);
   }
 
   resolveTxt(this: object | undefined, hostname: string, callback: ResolveCallback) {
     callback = validateCallback(arguments.length > 2 ? arguments[2] : callback);
-    deliver(Resolver.#getResolver(this).resolveTxt(hostname), callback);
+    deliver(traced(Resolver.#getResolver(this)).resolveTxt(hostname), callback);
   }
 
   resolveSoa(this: object | undefined, hostname: string, callback: ResolveCallback) {
     callback = validateCallback(arguments.length > 2 ? arguments[2] : callback);
-    deliver(Resolver.#getResolver(this).resolveSoa(hostname), callback);
+    deliver(traced(Resolver.#getResolver(this)).resolveSoa(hostname), callback);
   }
 
   reverse(this: object | undefined, ip: string, callback: ResolveCallback) {
     callback = validateCallback(arguments.length > 2 ? arguments[2] : callback);
-    deliver(Resolver.#getResolver(this).reverse(ip), callback);
+    deliver(traced(Resolver.#getResolver(this)).reverse(ip), callback);
   }
 
   setLocalAddress(first: string, second?: string) {
@@ -681,11 +690,11 @@ const promises = {
 
     if (options.all) {
       return translateErrorCode(
-        (dns.lookup(hostname, options) as Promise<LookupAddress[]>).then(promisifyLookupAll(options.order!)),
+        (traced(dns).lookup(hostname, options) as Promise<LookupAddress[]>).then(promisifyLookupAll(options.order!)),
       );
     }
     return translateErrorCode(
-      (dns.lookup(hostname, options) as Promise<LookupAddress[]>).then(promisifyLookup(options.order!)),
+      (traced(dns).lookup(hostname, options) as Promise<LookupAddress[]>).then(promisifyLookup(options.order!)),
     );
   },
 
@@ -700,7 +709,7 @@ const promises = {
     validatePort(port, "port");
 
     try {
-      return translateErrorCode(dns.lookupService(address, +port)).then(([hostname, service]) => ({
+      return translateErrorCode(traced(dns).lookupService(address, +port)).then(([hostname, service]) => ({
         hostname,
         service,
       }));
@@ -723,52 +732,54 @@ const promises = {
       throw $ERR_INVALID_ARG_TYPE("rrtype", "string", rrtype);
     }
 
-    const promise = dns.resolve(hostname, rrtype) as Promise<unknown[]>;
+    const promise = traced(dns).resolve(hostname, rrtype) as Promise<unknown[]>;
     return translateErrorCode(isAddressType(rrtype) ? promise.then(promisifyResolveX(false)) : promise);
   },
 
   resolve4(hostname: string, options?: { ttl?: boolean }) {
-    return translateErrorCode((dns.resolve(hostname, "A") as Promise<unknown[]>).then(promisifyResolveX(options?.ttl)));
+    return translateErrorCode(
+      (traced(dns).resolve(hostname, "A") as Promise<unknown[]>).then(promisifyResolveX(options?.ttl)),
+    );
   },
 
   resolve6(hostname: string, options?: { ttl?: boolean }) {
     return translateErrorCode(
-      (dns.resolve(hostname, "AAAA") as Promise<unknown[]>).then(promisifyResolveX(options?.ttl)),
+      (traced(dns).resolve(hostname, "AAAA") as Promise<unknown[]>).then(promisifyResolveX(options?.ttl)),
     );
   },
 
   resolveAny(hostname: string) {
-    return translateErrorCode(dns.resolveAny(hostname));
+    return translateErrorCode(traced(dns).resolveAny(hostname));
   },
   resolveSrv(hostname: string) {
-    return translateErrorCode(dns.resolveSrv(hostname));
+    return translateErrorCode(traced(dns).resolveSrv(hostname));
   },
   resolveTxt(hostname: string) {
-    return translateErrorCode(dns.resolveTxt(hostname));
+    return translateErrorCode(traced(dns).resolveTxt(hostname));
   },
   resolveSoa(hostname: string) {
-    return translateErrorCode(dns.resolveSoa(hostname));
+    return translateErrorCode(traced(dns).resolveSoa(hostname));
   },
   resolveNaptr(hostname: string) {
-    return translateErrorCode(dns.resolveNaptr(hostname));
+    return translateErrorCode(traced(dns).resolveNaptr(hostname));
   },
   resolveMx(hostname: string) {
-    return translateErrorCode(dns.resolveMx(hostname));
+    return translateErrorCode(traced(dns).resolveMx(hostname));
   },
   resolveCaa(hostname: string) {
-    return translateErrorCode(dns.resolveCaa(hostname));
+    return translateErrorCode(traced(dns).resolveCaa(hostname));
   },
   resolveNs(hostname: string) {
-    return translateErrorCode(dns.resolveNs(hostname));
+    return translateErrorCode(traced(dns).resolveNs(hostname));
   },
   resolvePtr(hostname: string) {
-    return translateErrorCode(dns.resolvePtr(hostname));
+    return translateErrorCode(traced(dns).resolvePtr(hostname));
   },
   resolveCname(hostname: string) {
-    return translateErrorCode(dns.resolveCname(hostname));
+    return translateErrorCode(traced(dns).resolveCname(hostname));
   },
   reverse(ip: string) {
-    return translateErrorCode(dns.reverse(ip));
+    return translateErrorCode(traced(dns).reverse(ip));
   },
 
   Resolver: class Resolver {
@@ -797,64 +808,64 @@ const promises = {
       } else if (typeof rrtype !== "string") {
         rrtype = null;
       }
-      const promise = Resolver.#getResolver(this).resolve(hostname, rrtype!);
+      const promise = traced(Resolver.#getResolver(this)).resolve(hostname, rrtype!);
       return translateErrorCode(isAddressType(rrtype) ? promise.then(promisifyResolveX(false)) : promise);
     }
 
     resolve4(this: object | undefined, hostname: string, options?: { ttl?: boolean }) {
       return translateErrorCode(
-        Resolver.#getResolver(this).resolve(hostname, "A").then(promisifyResolveX(options?.ttl)),
+        traced(Resolver.#getResolver(this)).resolve(hostname, "A").then(promisifyResolveX(options?.ttl)),
       );
     }
 
     resolve6(this: object | undefined, hostname: string, options?: { ttl?: boolean }) {
       return translateErrorCode(
-        Resolver.#getResolver(this).resolve(hostname, "AAAA").then(promisifyResolveX(options?.ttl)),
+        traced(Resolver.#getResolver(this)).resolve(hostname, "AAAA").then(promisifyResolveX(options?.ttl)),
       );
     }
 
     resolveAny(this: object | undefined, hostname: string) {
-      return translateErrorCode(Resolver.#getResolver(this).resolveAny(hostname));
+      return translateErrorCode(traced(Resolver.#getResolver(this)).resolveAny(hostname));
     }
 
     resolveCname(this: object | undefined, hostname: string) {
-      return translateErrorCode(Resolver.#getResolver(this).resolveCname(hostname));
+      return translateErrorCode(traced(Resolver.#getResolver(this)).resolveCname(hostname));
     }
 
     resolveMx(this: object | undefined, hostname: string) {
-      return translateErrorCode(Resolver.#getResolver(this).resolveMx(hostname));
+      return translateErrorCode(traced(Resolver.#getResolver(this)).resolveMx(hostname));
     }
 
     resolveNaptr(this: object | undefined, hostname: string) {
-      return translateErrorCode(Resolver.#getResolver(this).resolveNaptr(hostname));
+      return translateErrorCode(traced(Resolver.#getResolver(this)).resolveNaptr(hostname));
     }
 
     resolveNs(this: object | undefined, hostname: string) {
-      return translateErrorCode(Resolver.#getResolver(this).resolveNs(hostname));
+      return translateErrorCode(traced(Resolver.#getResolver(this)).resolveNs(hostname));
     }
 
     resolvePtr(this: object | undefined, hostname: string) {
-      return translateErrorCode(Resolver.#getResolver(this).resolvePtr(hostname));
+      return translateErrorCode(traced(Resolver.#getResolver(this)).resolvePtr(hostname));
     }
 
     resolveSoa(this: object | undefined, hostname: string) {
-      return translateErrorCode(Resolver.#getResolver(this).resolveSoa(hostname));
+      return translateErrorCode(traced(Resolver.#getResolver(this)).resolveSoa(hostname));
     }
 
     resolveSrv(this: object | undefined, hostname: string) {
-      return translateErrorCode(Resolver.#getResolver(this).resolveSrv(hostname));
+      return translateErrorCode(traced(Resolver.#getResolver(this)).resolveSrv(hostname));
     }
 
     resolveCaa(this: object | undefined, hostname: string) {
-      return translateErrorCode(Resolver.#getResolver(this).resolveCaa(hostname));
+      return translateErrorCode(traced(Resolver.#getResolver(this)).resolveCaa(hostname));
     }
 
     resolveTxt(this: object | undefined, hostname: string) {
-      return translateErrorCode(Resolver.#getResolver(this).resolveTxt(hostname));
+      return translateErrorCode(traced(Resolver.#getResolver(this)).resolveTxt(hostname));
     }
 
     reverse(this: object | undefined, ip: string) {
-      return translateErrorCode(Resolver.#getResolver(this).reverse(ip));
+      return translateErrorCode(traced(Resolver.#getResolver(this)).reverse(ip));
     }
 
     setLocalAddress(first: string, second?: string) {

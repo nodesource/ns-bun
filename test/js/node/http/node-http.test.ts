@@ -1709,7 +1709,8 @@ it("request(urlString, cb) does not read options from Object.prototype", async (
     const heads = [];
     const server = net.createServer(socket => {
       socket.once("data", data => {
-        heads.push(String(data).split("\\r\\n\\r\\n")[0]);
+        // With the N|Solid agent tracing, each request carries a traceparent of its own.
+        heads.push(String(data).split("\\r\\n\\r\\n")[0].replace(/\\r\\ntraceparent: [^\\r]*/i, ""));
         socket.end("HTTP/1.1 200 OK\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n");
       });
     });

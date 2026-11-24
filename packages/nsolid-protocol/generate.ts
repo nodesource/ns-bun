@@ -16,7 +16,12 @@ const here = import.meta.dirname;
 const protoDir = join(here, "proto");
 const outFile = join(here, "..", "..", "src", "js", "internal", "nsolid", "messages.ts");
 // The agent's service, and OTLP's metrics service on the same channel.
-const roots = ["nsolid_service.proto", "opentelemetry/proto/collector/metrics/v1/metrics_service.proto"];
+const roots = [
+  "nsolid_service.proto",
+  "opentelemetry/proto/collector/metrics/v1/metrics_service.proto",
+  "opentelemetry/proto/collector/trace/v1/trace_service.proto",
+  "opentelemetry/proto/collector/logs/v1/logs_service.proto",
+];
 
 const scalars = new Set([
   "double",
@@ -140,6 +145,9 @@ function parseFile(file: string, seen: Set<string>) {
         parseEnum(message.fullName);
       } else if (t === "reserved" || t === "option") {
         skipStatement();
+      } else if (t === ";") {
+        // An empty statement, as after a nested enum's "};".
+        i++;
       } else if (t === "oneof") {
         i++;
         next();

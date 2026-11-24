@@ -31,6 +31,7 @@ const {
 const kServerResponseStatistics = Symbol("ServerResponseStatistics");
 
 const { isPrimary } = require("internal/cluster/isPrimary");
+const nsolidHooks = require("internal/nsolid/hooks");
 const { addServerAbortSignalOption } = require("internal/net/server_abort_signal");
 const {
   kInternalSocketData,
@@ -66,6 +67,7 @@ const {
   kOutHeaders,
   onDataIncomingMessage,
   http1ServerPipeline,
+  kHeaderSource,
 } = require("internal/http");
 const { FakeSocket } = require("internal/http/FakeSocket");
 const NumberIsNaN = Number.isNaN;
@@ -168,6 +170,11 @@ function assignSocketInternal(self, socket) {
   setCloseCallback(socket, onServerResponseClose);
   self.socket = socket;
   self.emit("socket", socket);
+}
+
+// For the N|Solid agent: a request's headers from what the native handle captured, which `req.headers` reads later.
+function headersOfRequest(req) {
+  return req[kHeaderSource]?.headersObject();
 }
 
 function onServerResponseClose() {
@@ -1127,25 +1134,31 @@ Server.prototype[kRealListen] = function (tls, port, host, socketPath, reusePort
           http_res.writeHead(400, { Connection: "close" });
           http_res.end();
         } else {
-          if (isHttp11 && (dispatchBits & DISPATCH_HAS_EXPECT) !== 0) {
-            // Case-insensitive, token-boundary match like Node's
-            // parserOnIncoming (RFC 7231 5.1.1: expectation values compare
-            // case-insensitively); computed natively into the bitfield.
-            if ((dispatchBits & DISPATCH_EXPECT_CONTINUE) !== 0) {
-              if (server.listenerCount("checkContinue") > 0) {
-                server.emit("checkContinue", http_req, http_res);
+          // The N|Solid agent's span of the request is the active one while the listeners run.
+          const nsolidScope = nsolidHooks.httpServerRequest?.(http_req, http_res, headersOfRequest);
+          try {
+            if (isHttp11 && (dispatchBits & DISPATCH_HAS_EXPECT) !== 0) {
+              // Case-insensitive, token-boundary match like Node's
+              // parserOnIncoming (RFC 7231 5.1.1: expectation values compare
+              // case-insensitively); computed natively into the bitfield.
+              if ((dispatchBits & DISPATCH_EXPECT_CONTINUE) !== 0) {
+                if (server.listenerCount("checkContinue") > 0) {
+                  server.emit("checkContinue", http_req, http_res);
+                } else {
+                  http_res.writeContinue();
+                  server.emit("request", http_req, http_res);
+                }
+              } else if (server.listenerCount("checkExpectation") > 0) {
+                server.emit("checkExpectation", http_req, http_res);
               } else {
-                http_res.writeContinue();
-                server.emit("request", http_req, http_res);
+                http_res.writeHead(417);
+                http_res.end();
               }
-            } else if (server.listenerCount("checkExpectation") > 0) {
-              server.emit("checkExpectation", http_req, http_res);
             } else {
-              http_res.writeHead(417);
-              http_res.end();
+              server.emit("request", http_req, http_res);
             }
-          } else {
-            server.emit("request", http_req, http_res);
+          } finally {
+            nsolidScope?.[Symbol.dispose]();
           }
         }
 
@@ -4163,8 +4176,15 @@ ServerResponse.prototype.emit = function (event) {
     }
     callCloseCallback(this);
   }
+  if (event === "finish" || event === "close")
+    nsolidHooks.httpServerResponseEnd?.(this, event === "close", headersSent);
   return Stream.prototype.emit.$apply(this, arguments);
 };
+
+// For the N|Solid agent, of a response it saw begin.
+function headersSent(res) {
+  return res[headerStateSymbol] === NodeHTTPHeaderState.sent;
+}
 
 function emitResponseFinishedThenClose(res, callback) {
   emitResponseFinished(res, callback);

@@ -36,6 +36,10 @@ const takeSnapshot = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidTakeSna
 const checkLoops = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidCheckLoops", 1);
 const loopStack = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidLoopStack", 2);
 const onApiCommand = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidOnApiCommand", 1);
+const setTracing = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidSetTracing", 2);
+const takeSpans = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidTakeSpans", 0);
+const takeLogs = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidTakeLogs", 0);
+const scriptOf = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidScript", 2);
 
 // The main thread's `ScriptExecutionContext` identifier: its packages are the
 // ones reported, as in N|Solid.
@@ -45,6 +49,8 @@ const LOADED_MODULES_TIMEOUT_MS = 1000;
 
 const SERVICE = "grpcagent.NSolidService";
 const METRICS_SERVICE = "opentelemetry.proto.collector.metrics.v1.MetricsService";
+const TRACE_SERVICE = "opentelemetry.proto.collector.trace.v1.TraceService";
+const LOGS_SERVICE = "opentelemetry.proto.collector.logs.v1.LogsService";
 const SAAS_KEY_LENGTH = 40;
 const SAAS_CONSOLE_ID_LENGTH = 36;
 // N|Solid's reconnect rules (agents/grpc/src/grpc_agent.cc): the delay starts
@@ -68,7 +74,11 @@ const ASSET_FAILED = { code: 500, message: "Profile/Snapshot creation failure(10
 const SNAPSHOTS_DISABLED = { code: 500, message: "Heap Snapshots disabled(1004)" };
 const OUT_OF_MEMORY = { code: 500, message: "Internal Runtime Error(1005)" };
 const NOT_AVAILABLE = { code: 404, message: "Resource not available(1006)" };
+const RUNTIME_ERROR = { code: 500, message: "Internal Runtime Error(1007)" };
 const ASSETS_DISABLED = { code: 500, message: "Assets collection disabled(1008)" };
+// `source_code` while the Console has not turned source reads on. N|Solid has no such setting yet: this is the next
+// of its runtime error codes.
+const SOURCE_READS_DISABLED = { code: 500, message: "Source code reads disabled(1009)" };
 // An asset goes to the Console in chunks of this many bytes.
 const ASSET_CHUNK_BYTES = 1 << 20;
 // How long a thread may take to start or stop a profile: a thread in a long
@@ -84,13 +94,45 @@ const SNAPSHOT_TIMEOUT_MS = 10 * 60_000;
 // JavaScript, where N|Solid would send no event at all.
 const BLOCKED_LOOP_INTERVAL_MS = 100;
 const BLOCKED_LOOP_STACK_WAIT_MS = 1000;
+// N|Solid's span types that tracing turns on: dns, http_client, http_server and custom.
+const TRACED_SPAN_TYPES = 1 | 4 | 8 | 16;
+// N|Solid exports the spans every second, and sooner once more than 1,000 wait. One request carries 1,000 spans
+// or log lines at most, which keeps it far below the Console's size limit.
+const SPAN_EXPORT_MS = 1000;
+const SPAN_EXPORT_COUNT = 1000;
+const OTLP_BATCH = 1000;
 
 // What the agent does, as `InfoBody.capabilities` reports it: the commands it
 // answers, and the `ReconfigureBody` settings it applies.
 const CAPABILITIES = {
-  commands: ["info", "metrics", "packages", "profile", "reconfigure", "snapshot", "startup_times"],
-  settings: ["assetsEnabled", "blockedLoopThreshold", "interval", "pauseMetrics", "redactSnapshots", "tags"],
+  commands: ["info", "metrics", "packages", "profile", "reconfigure", "snapshot", "source_code", "startup_times"],
+  settings: [
+    "assetsEnabled",
+    "blockedLoopThreshold",
+    "contCpuProfile",
+    "interval",
+    "pauseMetrics",
+    "redactSnapshots",
+    "sourceCodeEnabled",
+    "tags",
+    "traceSampleRate",
+    "tracingEnabled",
+    "tracingModulesBlacklist",
+  ],
 };
+
+// How long a continuous profile's thread may take to start or stop it: past that, the window is given up.
+const CONTINUOUS_PROFILE_TIMEOUT_MS = 60_000;
+
+// A script's URL as a path: profiles name files by `file://` URL, stacks by path.
+function filePathOf(url: string): string {
+  if (!url.startsWith("file://")) return url;
+  try {
+    return Bun.fileURLToPath(url);
+  } catch {
+    return url;
+  }
+}
 
 // The RPC that carries each command's answer.
 const replyRpc: Record<string, string> = {
@@ -320,6 +362,14 @@ class Agent {
   inventory;
   // One `packages` answer at a time: a second waits for the scan the first started.
   packagesRun: Promise<unknown> = Promise.resolve();
+  // The trace flags and sample rate the threads were last given.
+  traceFlags = 0;
+  traceSampleRate = 1;
+  // Spans the threads ended, waiting for the next export.
+  spans: any[] = [];
+  // Continuous CPU profiles: each thread's running window, and the threads one is starting on.
+  windows = new Map<number, { contextId: number; startEpochMs: number; startPerf: number; intervalMs: number }>();
+  startingWindows = new Set<number>();
 
   constructor(
     endpoint: Endpoint,
@@ -365,6 +415,177 @@ class Agent {
     if (saasToken) this.metadata["nsolid-saas"] = saasToken;
     this.scheduleMetrics();
     setInterval(() => this.checkLoops(), BLOCKED_LOOP_INTERVAL_MS);
+    setInterval(() => this.exportSpans(), SPAN_EXPORT_MS);
+    setInterval(() => this.profileContinuously(), BLOCKED_LOOP_INTERVAL_MS);
+    this.applyTracing();
+  }
+
+  // N|Solid's continuous profiling: while `contCpuProfile` is on and assets are enabled, every thread is profiled
+  // in back-to-back windows of `contCpuProfileInterval` ms, each sent on its own `ExportContinuousProfile` stream.
+  // A thread whose profiler is taken (an on-demand profile) starts its window once it is free. A window that is
+  // running when profiling turns off still ends on time and is sent.
+  profileContinuously() {
+    const { config, windows, startingWindows } = this;
+    const on = !!config.contCpuProfile && config.assetsEnabled !== false;
+    const threads = nsolidThreads() as { contextId: number; threadId: number }[];
+    const now = performance.now();
+    for (const [threadId, window] of windows) {
+      if (!threads.some(thread => thread.threadId === threadId)) windows.delete(threadId);
+      else if (now - window.startPerf >= window.intervalMs) this.endWindow(threadId, window);
+    }
+    if (!on) return;
+    for (const { contextId, threadId } of threads) {
+      if (windows.has(threadId) || startingWindows.has(threadId) || this.profiles.has(threadId)) continue;
+      startingWindows.add(threadId);
+      const intervalMs = config.contCpuProfileInterval;
+      requests
+        .ask(startProfile, contextId, CONTINUOUS_PROFILE_TIMEOUT_MS)
+        .then(started => {
+          if (started?.startedAt) {
+            windows.set(threadId, {
+              contextId,
+              startEpochMs: started.startedAt / 1000,
+              startPerf: performance.now(),
+              intervalMs,
+            });
+          }
+        })
+        .finally(() => startingWindows.delete(threadId));
+    }
+  }
+
+  endWindow(threadId: number, window: { contextId: number; startEpochMs: number; startPerf: number }) {
+    this.windows.delete(threadId);
+    // Taken by the next tick only once this one's profile has stopped.
+    this.startingWindows.add(threadId);
+    requests
+      .ask(stopProfile, window.contextId, CONTINUOUS_PROFILE_TIMEOUT_MS)
+      .then(answer => {
+        if (!answer?.profile) return;
+        const profile = profiles.completeProfile(answer.profile, answer.stoppedAt, answer.collections, answer.waits);
+        const elapsedMs = performance.now() - window.startPerf;
+        const base = {
+          common: { requestId: crypto.randomBytes(20).toString("hex"), command: "profile", recorded: recorded() },
+          thread_id: threadId,
+          metadata: { fields: {} },
+        };
+        const data = Buffer.from(profile);
+        const messages: object[] = [];
+        for (let offset = 0; offset < data.length; offset += ASSET_CHUNK_BYTES) {
+          messages.push({ ...base, data: data.subarray(offset, offset + ASSET_CHUNK_BYTES) });
+        }
+        messages.push({
+          ...base,
+          complete: true,
+          duration: Math.floor(elapsedMs),
+          start_ts: window.startEpochMs,
+          end_ts: window.startEpochMs + elapsedMs,
+        });
+        return this.sendStream("ExportContinuousProfile", messages);
+      })
+      .catch((err: Error) => $debug("continuous profile failed:", err?.message))
+      .finally(() => this.startingWindows.delete(threadId));
+  }
+
+  // The `source_code` command: a script a thread loaded, by its id and its path (a profile's `file://` URL or a
+  // stack's path), read from disk when it is asked for, as N|Solid reads it. Only while the Console has turned
+  // source reads on.
+  async sourceCode(request) {
+    const args = request.args?.source_code ?? {};
+    const threadId = Number(args.thread_id ?? 0);
+    const path = String(args.path ?? "");
+    const reply = (fields: { error?: { code: number; message: string }; code?: Uint8Array; is_esm?: boolean }) =>
+      this.send("ExportSourceCode", {
+        common: this.common(request, fields.error),
+        thread_id: threadId,
+        path,
+        code: fields.code,
+        is_esm: fields.is_esm,
+      });
+    if (this.config.sourceCodeEnabled !== true) return reply({ error: SOURCE_READS_DISABLED });
+    const thread = threadOf(threadId);
+    if (!thread) return reply({ error: THREAD_GONE });
+    const script = scriptOf(thread.contextId, Number(args.script_id ?? 0)) as
+      { url: string; isEsm: boolean; code?: string } | undefined;
+    if (!script || filePathOf(script.url) !== filePathOf(path)) return reply({ error: RUNTIME_ERROR });
+    const { code: kept } = script;
+    let code: Uint8Array;
+    if (kept !== undefined) code = Buffer.from(kept);
+    else {
+      try {
+        code = fs.readFileSync(filePathOf(script.url));
+      } catch {
+        return reply({ error: RUNTIME_ERROR });
+      }
+    }
+    return reply({ code, is_esm: script.isEsm });
+  }
+
+  // N|Solid's trace flags: every span type while tracing is on, less the ones the blacklist names. The threads get
+  // them, with the sample rate, whenever either changes.
+  applyTracing() {
+    const { config } = this;
+    const flags = config.tracingEnabled ? TRACED_SPAN_TYPES & ~(config.tracingModulesBlacklist >>> 0) : 0;
+    const rate = config.traceSampleRate;
+    if (flags === this.traceFlags && rate === this.traceSampleRate) return;
+    this.traceFlags = flags;
+    this.traceSampleRate = rate;
+    setTracing(flags, rate);
+  }
+
+  // The spans the threads queued since the last call.
+  takeSpans() {
+    for (const json of takeSpans() as string[]) {
+      try {
+        this.spans.push(JSON.parse(json));
+      } catch {}
+    }
+    if (this.spans.length > SPAN_EXPORT_COUNT) this.exportSpans();
+  }
+
+  // Like N|Solid, spans that can't be sent now (no connection, tracing turned off since) are dropped.
+  exportSpans() {
+    const ended = this.spans;
+    if (!ended.length) return;
+    this.spans = [];
+    if (!this.session || !this.traceFlags) return;
+    const names = new Map<number, string>();
+    for (const thread of nsolidThreads() as { threadId: number; name: string }[])
+      names.set(thread.threadId, thread.name);
+    const identity = this.otlpIdentity();
+    for (let i = 0; i < ended.length; i += OTLP_BATCH) {
+      const spans = ended.slice(i, i + OTLP_BATCH).map(span => otlp.span(span, names.get(span.threadId) ?? ""));
+      this.send("Export", otlp.tracesRequest(identity, spans), TRACE_SERVICE).catch((err: Error) =>
+        $debug("trace export failed:", err?.message),
+      );
+    }
+  }
+
+  // `nsolid.logger` lines, sent as N|Solid sends them: all that are queued, at once, and dropped while there is no
+  // connection.
+  exportLogs() {
+    const logs = takeLogs() as any[];
+    if (!logs.length || !this.session) return;
+    const identity = this.otlpIdentity();
+    for (let i = 0; i < logs.length; i += OTLP_BATCH) {
+      const records = logs.slice(i, i + OTLP_BATCH).map(otlp.logRecord);
+      this.send("Export", otlp.logsRequest(identity, records), LOGS_SERVICE).catch((err: Error) =>
+        $debug("log export failed:", err?.message),
+      );
+    }
+  }
+
+  otlpIdentity() {
+    return {
+      agentId: this.agentId,
+      app: this.config.app,
+      appVersion: this.config.appVersion,
+      hostname: this.config.hostname,
+      main: this.config.main,
+      nodeEnv: this.config.nodeEnv,
+      tags: this.config.tags,
+      processStartMs: this.processStartMs,
+    };
   }
 
   // N|Solid's blocked-loop watchdog: `loop_blocked` once a thread's loop has
@@ -421,20 +642,7 @@ class Agent {
   async collectMetrics() {
     const proc = this.probe.sample();
     const threads = await nsolidMetrics.threadMetrics();
-    return otlp.resourceMetrics(
-      {
-        agentId: this.agentId,
-        app: this.config.app,
-        appVersion: this.config.appVersion,
-        hostname: this.config.hostname,
-        main: this.config.main,
-        nodeEnv: this.config.nodeEnv,
-        tags: this.config.tags,
-        processStartMs: this.processStartMs,
-      },
-      proc,
-      threads,
-    );
+    return otlp.resourceMetrics(this.otlpIdentity(), proc, threads);
   }
 
   connectOptions() {
@@ -678,6 +886,8 @@ class Agent {
   // thread's code: taken and sent as the Console's commands are, marked as
   // N|Solid marks them.
   apiCommand(command: string, threadId: number, value) {
+    if (command === "spans") return this.takeSpans();
+    if (command === "logs") return this.exportLogs();
     const requestId = crypto.randomBytes(20).toString("hex");
     const metadata = { fields: { reason: { string_value: "Agent API" } } };
     const failed = (err: Error) => $debug(`${command} from the API failed:`, err?.message);
@@ -721,6 +931,9 @@ class Agent {
     mainProfile: { profile: string; stoppedAt: number; collections: number[]; waits: number[] } | undefined,
   ) {
     if (!this.connected) return exitSent();
+    this.takeSpans();
+    this.exportSpans();
+    this.exportLogs();
     const common = { requestId: crypto.randomBytes(20).toString("hex"), command: "exit", recorded: recorded() };
     const error = message === undefined ? undefined : { message, stack: stack ?? "" };
     const entry = this.profiles.get(0);
@@ -760,6 +973,7 @@ class Agent {
         nsolidConfig.applyReconfigure(this.config, request.args?.reconfigure);
         publishConfig(JSON.stringify(this.config));
         if (this.config.interval !== interval) this.scheduleMetrics();
+        this.applyTracing();
         return this.send(rpc, { common: this.common(request), body: nsolidConfig.reconfigureBody(this.config) });
       }
       case "packages": {
@@ -777,6 +991,8 @@ class Agent {
         return this.profile(request);
       case "snapshot":
         return this.snapshot(request);
+      case "source_code":
+        return this.sourceCode(request);
       default: {
         const message: Record<string, any> = { common: this.common(request, NOT_AVAILABLE) };
         if (rpc === "ExportAsset") message.thread_id = request.args?.profile?.thread_id ?? 0;
@@ -799,6 +1015,7 @@ class Agent {
     nsolidConfig.applyUpdate(this.config, update);
     publishConfig(JSON.stringify(this.config));
     if (this.config.interval !== interval) this.scheduleMetrics();
+    this.applyTracing();
   }
 
   // Nanoseconds since the process started; the Console measures each mark
@@ -821,7 +1038,12 @@ export default function start(
   agentVmNs: number,
 ) {
   let agent: Agent | undefined;
-  onApiCommand((command: string, threadId: number, value: unknown) => agent?.apiCommand(command, threadId, value));
+  onApiCommand((command: string, threadId: number, value: unknown) => {
+    if (agent) return agent.apiCommand(command, threadId, value);
+    // Nothing exports what the threads queued: it is let go, so that they queue again.
+    if (command === "spans") takeSpans();
+    else if (command === "logs") takeLogs();
+  });
   const updates: object[] = onStart((json: string) => {
     const update = JSON.parse(json);
     if (agent) agent.update(update);

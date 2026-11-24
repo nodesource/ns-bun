@@ -151,6 +151,7 @@ const testOf = (name: string) => {
 
 // What the code of each answers.
 const answersOfNativeFunctions: readonly (readonly [b.BuiltinPath, b.TableType])[] = [
+  [cpp("AsyncContextFrame.cpp", "jsFunctionCallInFrameOf"), b.any],
   [cpp("BunDebugger.cpp", "jsFunction_closeNodeInspector"), b.undefined],
   // The error is handed back for open() to throw.
   [
@@ -178,15 +179,22 @@ const answersOfNativeFunctions: readonly (readonly [b.BuiltinPath, b.TableType])
   [cpp("NSolidAgent.cpp", "jsFunctionNSolidOnStart"), newArrayOf(b.string)],
   [cpp("NSolidAgent.cpp", "jsFunctionNSolidProcessStart"), b.f64],
   [cpp("NSolidAgent.cpp", "jsFunctionNSolidPublishConfig"), b.undefined],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidRecord"), b.undefined],
   [cpp("NSolidAgent.cpp", "jsFunctionNSolidRequestLoadedModules"), b.bool],
   [cpp("NSolidAgent.cpp", "jsFunctionNSolidRequestThreadHeap"), b.bool],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidScript"), b.union(b.plainData.fresh, b.undefined)],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidSendSpan"), b.undefined],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidSetTracing"), b.undefined],
   [cpp("NSolidAgent.cpp", "jsFunctionNSolidSharedConfig"), b.union(b.string, b.undefined)],
   [cpp("NSolidAgent.cpp", "jsFunctionNSolidStart"), b.bool],
   [cpp("NSolidAgent.cpp", "jsFunctionNSolidStartProfile"), b.bool],
   [cpp("NSolidAgent.cpp", "jsFunctionNSolidStopProfile"), b.bool],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidTakeLogs"), newArrayOf(b.plainData.fresh)],
   [cpp("NSolidAgent.cpp", "jsFunctionNSolidTakeSnapshot"), b.bool],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidTakeSpans"), newArrayOf(b.string)],
   [cpp("NSolidAgent.cpp", "jsFunctionNSolidThreadStats"), newArrayOf(b.plainData.fresh)],
   [cpp("NSolidAgent.cpp", "jsFunctionNSolidThreads"), newArrayOf(b.plainData.fresh)],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidWriteLog"), b.undefined],
   [cpp("Worker.cpp", "jsFunctionPostMessage"), b.undefined],
 ];
 

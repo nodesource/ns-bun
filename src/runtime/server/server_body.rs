@@ -119,6 +119,7 @@ trait RequestCtxOps: RequestCtx {
         method: Option<http::Method>,
     );
     fn dispatch(&self) -> Self::Dispatch;
+    fn set_serve_trace(dispatch: &Self::Dispatch, trace: super::ServeTrace);
     fn respond(
         dispatch: Self::Dispatch,
         server: &Self::Server,
@@ -181,6 +182,10 @@ where
     #[inline]
     fn dispatch(&self) -> Self::Dispatch {
         Dispatch::new(self)
+    }
+    #[inline]
+    fn set_serve_trace(dispatch: &Self::Dispatch, trace: super::ServeTrace) {
+        dispatch.set_serve_trace(trace)
     }
     #[inline]
     fn respond(
@@ -2392,6 +2397,9 @@ where
         req: &mut Ctx::Req,
         response_value: JSValue,
     ) {
+        if let Some(trace) = super::ServeTrace::take(self.global_this()) {
+            Ctx::set_serve_trace(&ctx, trace);
+        }
         let Some(ctx) = Ctx::respond(ctx, self, request.to_js(), response_value) else {
             return;
         };
@@ -2421,11 +2429,16 @@ where
 
         let global = self.global_this();
         let request = DispatchedRequest(request.wrap(global));
-        let response_value =
-            match on_request_fn.call(global, js_value, &[request.to_js(), js_value]) {
-                Ok(v) => v,
-                Err(err) => global.take_exception(err),
-            };
+        let called = super::serve_trace::call_fetch_handler(
+            global,
+            on_request_fn,
+            request.to_js(),
+            js_value,
+        );
+        let response_value = match called {
+            Ok(v) => v,
+            Err(err) => global.take_exception(err),
+        };
 
         self.handle_request_for::<Ctx>(&request, ctx, req, response_value);
     }

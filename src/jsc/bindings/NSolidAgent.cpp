@@ -28,6 +28,7 @@
 #include <wtf/WallTime.h>
 #include <wtf/text/MakeString.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <mutex>
 
@@ -35,8 +36,80 @@ using namespace JSC;
 using WebCore::ScriptExecutionContext;
 
 extern "C" void Bun__NSolid__noteRequestedCollection(bool full);
+extern "C" uint32_t Bun__NSolid__requestsInFlight();
 
 namespace Bun {
+
+// What internal/nsolid/tracing.ts records (its `Record`), in that order.
+enum class NSolidRecord : uint32_t {
+    HttpClient,
+    HttpClientAbort,
+    HttpServer,
+    HttpServerAbort,
+    DnsCall,
+    DnsDone,
+};
+
+// N|Solid's counters of HTTP and DNS transactions, in the order the agent
+// reads them.
+enum NSolidTransaction : uint8_t {
+    DnsCount,
+    HttpClientAbortCount,
+    HttpClientCount,
+    HttpServerAbortCount,
+    HttpServerCount,
+    NSolidTransactionCount,
+};
+
+// The handles N|Solid counts as a thread opens and closes them: each kind's
+// created and destroyed counters, in nsolid_agent.rs's `Handle` order.
+static constexpr size_t NSolidHandleCounterCount = 12;
+
+// The latencies whose median and 99th percentile N|Solid reports.
+enum NSolidLatency : uint8_t {
+    DnsLatency,
+    HttpClientLatency,
+    HttpServerLatency,
+    NSolidLatencyCount,
+};
+
+// The latencies of one metrics interval. Past `capacity`, each new one
+// replaces a kept one at random (reservoir sampling), so the percentiles
+// still describe the whole interval.
+struct NSolidLatencyWindow {
+    static constexpr size_t capacity = 1 << 14;
+
+    Vector<double> values;
+    uint64_t seen { 0 };
+    uint64_t random { 0x9e3779b97f4a7c15 };
+
+    void add(double ms)
+    {
+        seen++;
+        if (values.size() < capacity) {
+            values.append(ms);
+            return;
+        }
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        uint64_t slot = random % seen;
+        if (slot < capacity)
+            values[slot] = ms;
+    }
+
+    Vector<double> take()
+    {
+        seen = 0;
+        return std::exchange(values, {});
+    }
+};
+
+struct NSolidScript {
+    WTF::String url;
+    bool isEsm { false };
+    WTF::String code;
+};
 
 // A JS thread's event-loop and GC figures. The thread writes them; the agent's
 // thread reads them for the metrics it exports. The loop's own timing is the
@@ -113,6 +186,26 @@ struct NSolidThreadStats : ThreadSafeRefCounted<NSolidThreadStats> {
     // it reported, so that it reports each once, and its end as the same loop.
     uint64_t reportedExitNs { 0 };
     uint64_t reportedLoopId { 0 };
+
+    // N|Solid's HTTP and DNS figures (internal/nsolid/tracing.ts records
+    // them): counts since the thread registered, and the latencies (ms) since
+    // the agent last read them.
+    std::atomic<uint64_t> transactions[NSolidTransactionCount] {};
+    Lock latencyLock;
+    NSolidLatencyWindow latencies[NSolidLatencyCount] WTF_GUARDED_BY_LOCK(latencyLock);
+
+    // N|Solid's handle counters, and its active handles and requests: what
+    // keeps the loop alive, and the work sent off the thread, at the start of
+    // the last iteration.
+    std::atomic<uint64_t> handles[NSolidHandleCounterCount] {};
+    std::atomic<uint32_t> activeHandles { 0 };
+    std::atomic<uint32_t> activeRequests { 0 };
+
+    // The scripts the thread loaded, by source id, for the agent's
+    // `source_code`, as N|Solid's EnvInst keeps them: the first entry for an
+    // id stays. The code is kept only for a script that is not a file.
+    Lock scriptsLock;
+    HashMap<uint64_t, NSolidScript, WTF::IntHash<uint64_t>, WTF::UnsignedWithZeroKeyHashTraits<uint64_t>> scripts WTF_GUARDED_BY_LOCK(scriptsLock);
 };
 
 // A collection's start and end, from the collecting thread or JSC's collector
@@ -227,6 +320,11 @@ static void loopIteration(us_loop_timing* timing, uint64_t now)
 
     stats.providerDelay.fetch_add(providerDelay, std::memory_order_relaxed);
     stats.processingDelay.fetch_add(processingDelay, std::memory_order_relaxed);
+    // The loop is held open by each request in flight as well.
+    uint32_t requests = Bun__NSolid__requestsInFlight();
+    uint32_t active = __atomic_load_n(&timing->active, __ATOMIC_RELAXED);
+    stats.activeRequests.store(requests, std::memory_order_relaxed);
+    stats.activeHandles.store(active > requests ? active - requests : 0, std::memory_order_relaxed);
     stats.previousProcessing = processing;
     stats.previousTime = now;
     stats.previousIdle = idle;
@@ -428,14 +526,21 @@ JSC_DEFINE_HOST_FUNCTION(jsFunctionNSolidThreadStats, (JSC::JSGlobalObject * glo
     auto scope = DECLARE_THROW_SCOPE(vm);
     struct Snapshot {
         uint32_t contextId;
-        double values[25];
+        double values[50];
     };
     static constexpr ASCIILiteral names[] = {
         "nowNs"_s, "registeredNs"_s, "registeredIdleNs"_s, "loopStartNs"_s, "loopEntryNs"_s, "loopExitNs"_s,
         "loopIdleTime"_s, "loopIterations"_s, "loopIterWithEvents"_s, "eventsProcessed"_s, "eventsWaiting"_s,
         "providerDelay"_s, "processingDelay"_s, "res5s"_s, "res1m"_s, "res5m"_s, "res15m"_s,
         "rollingEstimatedLag"_s, "gcCount"_s, "gcForcedCount"_s, "gcFullCount"_s, "gcMajorCount"_s,
-        "gcDurUsMedian"_s, "gcDurUs99Ptile"_s, "gcCollections"_s
+        "gcDurUsMedian"_s, "gcDurUs99Ptile"_s, "gcCollections"_s,
+        "dnsCount"_s, "httpClientAbortCount"_s, "httpClientCount"_s, "httpServerAbortCount"_s, "httpServerCount"_s,
+        "dnsMedian"_s, "dns99Ptile"_s, "httpClientMedian"_s, "httpClient99Ptile"_s, "httpServerMedian"_s,
+        "httpServer99Ptile"_s, "activeHandles"_s, "activeRequests"_s,
+        "tcpServerCreatedCount"_s, "tcpServerDestroyedCount"_s, "tcpSocketCreatedCount"_s, "tcpSocketDestroyedCount"_s,
+        "udpSocketCreatedCount"_s, "udpSocketDestroyedCount"_s, "pipeServerCreatedCount"_s,
+        "pipeServerDestroyedCount"_s, "pipeSocketCreatedCount"_s, "pipeSocketDestroyedCount"_s,
+        "fsHandlesOpenedCount"_s, "fsHandlesClosedCount"_s
     };
     static_assert(std::size(names) == std::extent_v<decltype(Snapshot::values)>);
     Vector<Snapshot> snapshots;
@@ -457,6 +562,18 @@ JSC_DEFINE_HOST_FUNCTION(jsFunctionNSolidThreadStats, (JSC::JSGlobalObject * glo
             uint64_t collections = durations.size();
             double gcMedian = median(durations);
             double gc99 = percentile(durations, 0.99);
+            Vector<double> latencies[NSolidLatencyCount];
+            {
+                Locker latencyLocker { stats.latencyLock };
+                for (size_t kind = 0; kind < NSolidLatencyCount; kind++)
+                    latencies[kind] = stats.latencies[kind].take();
+            }
+            auto transactions = [&](NSolidTransaction kind) {
+                return static_cast<double>(stats.transactions[kind].load(std::memory_order_relaxed));
+            };
+            auto handles = [&](size_t counter) {
+                return static_cast<double>(stats.handles[counter].load(std::memory_order_relaxed));
+            };
             snapshots.append({ thread.contextId, {
                                                      static_cast<double>(now),
                                                      static_cast<double>(stats.registeredNs),
@@ -483,6 +600,31 @@ JSC_DEFINE_HOST_FUNCTION(jsFunctionNSolidThreadStats, (JSC::JSGlobalObject * glo
                                                      gcMedian,
                                                      gc99,
                                                      static_cast<double>(collections),
+                                                     transactions(DnsCount),
+                                                     transactions(HttpClientAbortCount),
+                                                     transactions(HttpClientCount),
+                                                     transactions(HttpServerAbortCount),
+                                                     transactions(HttpServerCount),
+                                                     median(latencies[DnsLatency]),
+                                                     percentile(latencies[DnsLatency], 0.99),
+                                                     median(latencies[HttpClientLatency]),
+                                                     percentile(latencies[HttpClientLatency], 0.99),
+                                                     median(latencies[HttpServerLatency]),
+                                                     percentile(latencies[HttpServerLatency], 0.99),
+                                                     static_cast<double>(stats.activeHandles.load(std::memory_order_relaxed)),
+                                                     static_cast<double>(stats.activeRequests.load(std::memory_order_relaxed)),
+                                                     handles(0),
+                                                     handles(1),
+                                                     handles(2),
+                                                     handles(3),
+                                                     handles(4),
+                                                     handles(5),
+                                                     handles(6),
+                                                     handles(7),
+                                                     handles(8),
+                                                     handles(9),
+                                                     handles(10),
+                                                     handles(11),
                                                  } });
         }
     }
@@ -1159,6 +1301,292 @@ JSC_DEFINE_HOST_FUNCTION(jsFunctionNSolidApiProfileEnd, (JSC::JSGlobalObject * g
     return JSValue::encode(jsNumber(posted ? 0 : apiNotAvailable));
 }
 
+// The trace flags (N|Solid's span types) and the share of traces sampled,
+// which the agent sets and every thread's tracer reads.
+static std::atomic<uint32_t> traceFlags { 0 };
+static std::atomic<double> traceSampleRate { 1 };
+
+// Hands the calling thread's tracer (internal/nsolid/tracing.ts) the trace
+// flags and the sample rate. The tracer also records the HTTP and DNS
+// metrics, so it runs on every thread the agent watches.
+static void updateThreadTracing(Zig::GlobalObject* globalObject)
+{
+    auto& vm = globalObject->vm();
+    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+    JSValue update = BUN_REQUIRE_INTERNAL_MODULE(globalObject, InternalNsolidTracing, "Startup", "update"_s);
+    if (!scope.exception() && update.isCallable()) {
+        MarkedArgumentBuffer arguments;
+        arguments.append(jsNumber(traceFlags.load()));
+        arguments.append(jsNumber(traceSampleRate.load()));
+        JSC::call(globalObject, update, arguments, "N|Solid tracing"_s);
+    }
+    if (auto* exception = scope.exception()) {
+        scope.clearException();
+        Zig::GlobalObject::reportUncaughtExceptionAtEventLoop(globalObject, exception);
+    }
+}
+
+// For the agent: (flags, sampleRate), which every thread's tracer gets.
+JSC_DEFINE_HOST_FUNCTION(jsFunctionNSolidSetTracing, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    auto& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    uint32_t flags = callFrame->argument(0).toUInt32(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    double rate = callFrame->argument(1).toNumber(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    traceFlags.store(flags);
+    traceSampleRate.store(std::isfinite(rate) ? std::clamp(rate, 0.0, 1.0) : 1.0);
+    Vector<uint32_t> contextIds;
+    {
+        Locker locker { nsolidThreadsLock };
+        for (auto& thread : nsolidThreads())
+            contextIds.append(thread.contextId);
+    }
+    for (uint32_t contextId : contextIds) {
+        ScriptExecutionContext::postTaskTo(contextId, BunLoopKind::Regular, [](ScriptExecutionContext& context) {
+            if (auto* global = defaultGlobalObject(context.jsGlobalObject()))
+                updateThreadTracing(global);
+        });
+    }
+    return JSValue::encode(jsUndefined());
+}
+
+// What the threads hand the agent in bulk: their ended spans, as JSON, and
+// their `nsolid.logger` lines. A thread queues them here; the agent is told
+// when a queue stops being empty, and takes all it holds, as N|Solid's agent
+// takes log lines. Past the limit, new ones are dropped.
+static constexpr size_t agentQueueLimit = 1 << 16;
+
+struct NSolidLogRecord {
+    WTF::String body;
+    uint32_t severity;
+    uint64_t timeNs;
+    WTF::String traceId;
+    WTF::String spanId;
+    uint32_t traceFlags;
+};
+
+static Lock agentQueuesLock;
+static Vector<WTF::String> queuedSpans WTF_GUARDED_BY_LOCK(agentQueuesLock);
+static Vector<NSolidLogRecord> queuedLogs WTF_GUARDED_BY_LOCK(agentQueuesLock);
+
+// Tells the agent that a queue holds something (`command` is "spans" or
+// "logs"). False when no agent listens.
+static bool wakeAgentFor(ASCIILiteral command)
+{
+    return postToAgentApi(command, 0, [](VM&, JSC::JSGlobalObject*) -> JSValue { return jsUndefined(); });
+}
+
+// A span the calling thread ended, as JSON.
+JSC_DEFINE_HOST_FUNCTION(jsFunctionNSolidSendSpan, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    auto& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    WTF::String json = callFrame->argument(0).toWTFString(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    bool wasEmpty;
+    {
+        Locker locker { agentQueuesLock };
+        if (queuedSpans.size() >= agentQueueLimit)
+            return JSValue::encode(jsUndefined());
+        wasEmpty = queuedSpans.isEmpty();
+        queuedSpans.append(json.isolatedCopy());
+    }
+    if (wasEmpty && !wakeAgentFor("spans"_s)) {
+        Locker locker { agentQueuesLock };
+        queuedSpans.clear();
+    }
+    return JSValue::encode(jsUndefined());
+}
+
+// `nsolid.logger`: (body, severity, traceId, spanId, traceFlags), stamped
+// with the wall clock in ns, as N|Solid stamps it. Dropped when no agent runs.
+JSC_DEFINE_HOST_FUNCTION(jsFunctionNSolidWriteLog, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    auto& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    uint64_t timeNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    WTF::String body = callFrame->argument(0).toWTFString(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    uint32_t severity = callFrame->argument(1).toUInt32(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    WTF::String traceId = callFrame->argument(2).toWTFString(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    WTF::String spanId = callFrame->argument(3).toWTFString(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    uint32_t flags = callFrame->argument(4).toUInt32(globalObject) & 0xff;
+    RETURN_IF_EXCEPTION(scope, {});
+    bool wasEmpty;
+    {
+        Locker locker { agentQueuesLock };
+        if (queuedLogs.size() >= agentQueueLimit)
+            return JSValue::encode(jsUndefined());
+        wasEmpty = queuedLogs.isEmpty();
+        queuedLogs.append({ body.isolatedCopy(), severity, timeNs, traceId.isolatedCopy(), spanId.isolatedCopy(), flags });
+    }
+    if (wasEmpty && !wakeAgentFor("logs"_s)) {
+        Locker locker { agentQueuesLock };
+        queuedLogs.clear();
+    }
+    return JSValue::encode(jsUndefined());
+}
+
+// A script URL that names a file on disk. A virtual or plugin module, a
+// `data:` URL or a compiled executable's /$bunfs/ file has none.
+static bool isFileOnDisk(const WTF::String& url)
+{
+    if (url.startsWith("file://"_s))
+        return true;
+#if OS(WINDOWS)
+    if (url.length() > 2 && isASCIIAlpha(url[0]) && url[1] == ':')
+        return true;
+#endif
+    return url.startsWith('/') && !url.startsWith("/$bunfs/"_s);
+}
+
+// A script the calling thread loaded, for `source_code`. A file is read when
+// it is asked for, as N|Solid reads it; any other script's code is kept.
+void nsolidNoteScript(JSC::SourceProvider& provider, bool isEsm)
+{
+    auto* current = currentThread;
+    if (!current)
+        return;
+    WTF::String url = provider.sourceURL();
+    if (url.isEmpty())
+        return;
+    WTF::String code = isFileOnDisk(url) ? WTF::String() : provider.source().toString().isolatedCopy();
+    Locker locker { current->stats->scriptsLock };
+    current->stats->scripts.add(provider.asID(), NSolidScript { url.isolatedCopy(), isEsm, WTF::move(code) });
+}
+
+// For the agent: (contextId, scriptId), the script that thread loaded with
+// that id, as { url, isEsm, code? }, or undefined.
+JSC_DEFINE_HOST_FUNCTION(jsFunctionNSolidScript, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    auto& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    uint32_t contextId = callFrame->argument(0).toUInt32(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    double scriptId = callFrame->argument(1).toNumber(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    if (!(scriptId >= 0 && scriptId <= static_cast<double>(std::numeric_limits<uint32_t>::max())))
+        return JSValue::encode(jsUndefined());
+    std::optional<NSolidScript> script;
+    {
+        Locker locker { nsolidThreadsLock };
+        auto& threads = nsolidThreads();
+        size_t index = threads.findIf([&](auto& thread) { return thread.contextId == contextId; });
+        if (index != notFound && threads[index].stats) {
+            auto& stats = *threads[index].stats;
+            Locker scriptsLocker { stats.scriptsLock };
+            auto it = stats.scripts.find(static_cast<uint64_t>(scriptId));
+            if (it != stats.scripts.end())
+                script = NSolidScript { it->value.url.isolatedCopy(), it->value.isEsm, it->value.code.isolatedCopy() };
+        }
+    }
+    if (!script)
+        return JSValue::encode(jsUndefined());
+    auto* answer = constructEmptyObject(globalObject);
+    answer->putDirect(vm, Identifier::fromString(vm, "url"_s), jsString(vm, script->url));
+    answer->putDirect(vm, Identifier::fromString(vm, "isEsm"_s), jsBoolean(script->isEsm));
+    if (!script->code.isNull())
+        answer->putDirect(vm, Identifier::fromString(vm, "code"_s), jsString(vm, script->code));
+    return JSValue::encode(answer);
+}
+
+// For the agent: the spans queued, as JSON strings, which leave the queue.
+JSC_DEFINE_HOST_FUNCTION(jsFunctionNSolidTakeSpans, (JSC::JSGlobalObject * globalObject, JSC::CallFrame*))
+{
+    auto& vm = globalObject->vm();
+    Vector<WTF::String> spans;
+    {
+        Locker locker { agentQueuesLock };
+        spans = std::exchange(queuedSpans, {});
+    }
+    MarkedArgumentBuffer values;
+    for (auto& span : spans)
+        values.append(jsString(vm, span));
+    return JSValue::encode(constructArray(globalObject, static_cast<ArrayAllocationProfile*>(nullptr), values));
+}
+
+// For the agent: the log lines queued, as
+// [{ body, severity, time (ns, a decimal string), traceId, spanId, traceFlags }],
+// which leave the queue.
+JSC_DEFINE_HOST_FUNCTION(jsFunctionNSolidTakeLogs, (JSC::JSGlobalObject * globalObject, JSC::CallFrame*))
+{
+    auto& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    Vector<NSolidLogRecord> logs;
+    {
+        Locker locker { agentQueuesLock };
+        logs = std::exchange(queuedLogs, {});
+    }
+    auto* array = constructEmptyArray(globalObject, nullptr, logs.size());
+    RETURN_IF_EXCEPTION(scope, {});
+    for (unsigned i = 0; i < logs.size(); i++) {
+        auto& log = logs[i];
+        auto* record = constructEmptyObject(globalObject);
+        record->putDirect(vm, Identifier::fromString(vm, "body"_s), jsString(vm, log.body));
+        record->putDirect(vm, Identifier::fromString(vm, "severity"_s), jsNumber(log.severity));
+        record->putDirect(vm, Identifier::fromString(vm, "time"_s), jsString(vm, WTF::String::number(log.timeNs)));
+        record->putDirect(vm, Identifier::fromString(vm, "traceId"_s), jsString(vm, log.traceId));
+        record->putDirect(vm, Identifier::fromString(vm, "spanId"_s), jsString(vm, log.spanId));
+        record->putDirect(vm, Identifier::fromString(vm, "traceFlags"_s), jsNumber(log.traceFlags));
+        array->putDirectIndex(globalObject, i, record);
+        RETURN_IF_EXCEPTION(scope, {});
+    }
+    return JSValue::encode(array);
+}
+
+// internal/nsolid/tracing.ts: (what, ms) for the calling thread's HTTP and
+// DNS figures. A client request that failed before its response counts as
+// an abort and leaves no latency, as in N|Solid.
+JSC_DEFINE_HOST_FUNCTION(jsFunctionNSolidRecord, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    auto& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    uint32_t what = callFrame->argument(0).toUInt32(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    double ms = callFrame->argument(1).toNumber(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    auto* current = currentThread;
+    if (!current)
+        return JSValue::encode(jsUndefined());
+    auto& stats = current->stats.get();
+    auto count = [&](NSolidTransaction kind) {
+        stats.transactions[kind].fetch_add(1, std::memory_order_relaxed);
+    };
+    auto latency = [&](NSolidLatency kind) {
+        Locker locker { stats.latencyLock };
+        stats.latencies[kind].add(std::max(ms, 0.0));
+    };
+    switch (static_cast<NSolidRecord>(what)) {
+    case NSolidRecord::HttpClient:
+        count(HttpClientCount);
+        latency(HttpClientLatency);
+        break;
+    case NSolidRecord::HttpClientAbort:
+        count(HttpClientAbortCount);
+        break;
+    case NSolidRecord::HttpServer:
+        count(HttpServerCount);
+        latency(HttpServerLatency);
+        break;
+    case NSolidRecord::HttpServerAbort:
+        count(HttpServerAbortCount);
+        latency(HttpServerLatency);
+        break;
+    case NSolidRecord::DnsCall:
+        count(DnsCount);
+        break;
+    case NSolidRecord::DnsDone:
+        latency(DnsLatency);
+        break;
+    }
+    return JSValue::encode(jsUndefined());
+}
+
 // When the process started, in milliseconds since the epoch: the same on
 // every thread.
 JSC_DEFINE_HOST_FUNCTION(jsFunctionNSolidProcessStart, (JSC::JSGlobalObject*, JSC::CallFrame*))
@@ -1301,8 +1729,12 @@ extern "C" void Bun__NSolid__registerThread(JSC::JSGlobalObject* globalObject, u
         };
     }
     __atomic_store_n(&us_loop_iteration_hook, loopIteration, __ATOMIC_RELAXED);
-    Locker locker { nsolidThreadsLock };
-    nsolidThreads().append({ contextId, WTF::emptyString(), WTF::move(stats), &vm });
+    {
+        Locker locker { nsolidThreadsLock };
+        nsolidThreads().append({ contextId, WTF::emptyString(), WTF::move(stats), &vm });
+    }
+    if (auto* global = defaultGlobalObject(globalObject))
+        updateThreadTracing(global);
 }
 
 // On the thread being taken off, before its VM goes away.
@@ -1312,6 +1744,13 @@ extern "C" void Bun__NSolid__unregisterThread(uint32_t contextId)
     delete std::exchange(currentThread, nullptr);
     Locker locker { nsolidThreadsLock };
     nsolidThreads().removeFirstMatching([&](auto& thread) { return thread.contextId == contextId; });
+}
+
+// A handle the calling thread opened or closed (nsolid_agent.rs `count_handle`).
+extern "C" void Bun__NSolid__countHandle(uint8_t counter)
+{
+    if (auto* current = Bun::currentThread; current && counter < Bun::NSolidHandleCounterCount)
+        current->stats->handles[counter].fetch_add(1, std::memory_order_relaxed);
 }
 
 // A collection that code asked for (`Bun.gc`, `gc()`, `bun:jsc`), counted as

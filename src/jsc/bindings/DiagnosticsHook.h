@@ -18,6 +18,7 @@ enum class DiagnosticsHook : uint8_t {
     SqliteQuery,
     Request,
     WebSocket,
+    Serve,
     Count,
 };
 
