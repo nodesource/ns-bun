@@ -219,6 +219,9 @@ static std::pair<NodeType, String> describe(VM& vm, JSCell* cell, bool redact)
     }
     if (!cell->isObject())
         return { NodeType::Hidden, systemName(cell) };
+    // Closures compiled ahead of time (release builds) have no realm to ask.
+    if (isCompiledCalleeType(cell->type()))
+        return { NodeType::Closure, String(cell->className()) };
     if (auto* function = dynamicDowncast<JSFunction>(cell))
         return { NodeType::Closure, truncatedName(function->nameWithoutGC(vm)) };
     if (auto* function = dynamicDowncast<InternalFunction>(cell))
@@ -227,7 +230,14 @@ static std::pair<NodeType, String> describe(VM& vm, JSCell* cell, bool redact)
         return { NodeType::RegExp, redact ? String("(redacted)"_s) : truncatedName(regExp->regExp()->pattern()) };
     if (dynamicDowncast<JSScope>(cell))
         return { NodeType::Hidden, String("system / Context"_s) };
-    return { NodeType::Object, truncatedName(JSObject::calculatedClassName(asObject(cell))) };
+    // A plain object is named after its constructor, which is looked up in
+    // its realm; some objects have none, and keep their class's name.
+    auto* object = asObject(cell);
+    if (object->classInfo() == JSObject::info() || object->classInfo() == JSFinalObject::info()) {
+        if (object->realmMayBeNull())
+            return { NodeType::Object, truncatedName(JSObject::calculatedClassName(object)) };
+    }
+    return { NodeType::Object, String(cell->className()) };
 }
 
 static ASCIILiteral rootName(RootMarkReason reason)
@@ -255,7 +265,7 @@ public:
 
     void analyzeEdge(JSCell* from, JSCell* to, RootMarkReason reason) final
     {
-        if (from == to)
+        if (!to || from == to)
             return;
         Locker locker { m_lock };
         m_edges.append({ from, to, from ? EdgeType::Hidden : EdgeType::Element, reason, 0, nullptr });
@@ -263,18 +273,24 @@ public:
 
     void analyzePropertyNameEdge(JSCell* from, JSCell* to, UniquedStringImpl* name) final
     {
+        if (!from || !to || !name)
+            return;
         Locker locker { m_lock };
         m_edges.append({ from, to, EdgeType::Property, RootMarkReason::None, 0, name });
     }
 
     void analyzeVariableNameEdge(JSCell* from, JSCell* to, UniquedStringImpl* name) final
     {
+        if (!from || !to || !name)
+            return;
         Locker locker { m_lock };
         m_edges.append({ from, to, EdgeType::Context, RootMarkReason::None, 0, name });
     }
 
     void analyzeIndexEdge(JSCell* from, JSCell* to, uint32_t index) final
     {
+        if (!from || !to)
+            return;
         Locker locker { m_lock };
         m_edges.append({ from, to, EdgeType::Element, RootMarkReason::None, index, nullptr });
     }

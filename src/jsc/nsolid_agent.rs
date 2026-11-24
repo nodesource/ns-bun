@@ -39,6 +39,7 @@ unsafe extern "C" {
     safe fn Bun__NSolid__unregisterThread(context_id: u32);
     safe fn Bun__NSolid__noteRequestedCollection(full: bool);
     safe fn Bun__NSolid__recordFatalError(global: &JSGlobalObject, error: JSValue);
+    #[cfg(unix)]
     fn Bun__NSolid__recordCrash(
         reason: *const u8,
         reason_len: usize,
