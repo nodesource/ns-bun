@@ -1916,7 +1916,7 @@ describe("N|Solid agent", () => {
       const traceId = "4bf92f3577b34da6a3ce929d0e0e4736";
       const callerSpanId = "00f067aa0ba902b7";
       let poking = true;
-      (async () => {
+      const pokes = (async () => {
         while (poking) {
           await fetch(`http://127.0.0.1:${port}/outer`, {
             headers: { traceparent: `00-${traceId}-${callerSpanId}-01` },
@@ -1991,7 +1991,9 @@ describe("N|Solid agent", () => {
           break;
         }
       } finally {
+        // The last request ends before the server does.
         poking = false;
+        await pokes;
       }
     });
 
@@ -2027,6 +2029,113 @@ describe("N|Solid agent", () => {
         if (Number(metricPoint(request, "dnsCount").sum.data_points[0].as_int) > 0) break;
       }
     });
+
+    test.concurrent("of node:dns, which hands the application each answer as it does without the agent", async () => {
+      // Counts the looks for a `then` on an answer. Lookups run until stdin says to measure one.
+      const script = `
+        const { lookup } = require("node:dns").promises;
+        let looks = 0;
+        Object.defineProperty(Array.prototype, "then", {
+          configurable: true,
+          get() {
+            if (this[0]?.address) looks++;
+          },
+        });
+        let last = Promise.resolve();
+        const warm = setInterval(() => (last = lookup("localhost", { all: true }).catch(() => {})), 50);
+        process.stdin.once("data", async () => {
+          clearInterval(warm);
+          await last;
+          const before = looks;
+          await lookup("localhost", { all: true });
+          console.log(looks - before);
+          process.exit(0);
+        });`;
+      const looksOfOneLookup = async (proc: { stdin: Bun.FileSink; stdout: ReadableStream<Uint8Array> }) => {
+        proc.stdin.write("measure\n");
+        proc.stdin.flush();
+        return Number(await lineReader(proc.stdout)());
+      };
+      await using plain = Bun.spawn({
+        cmd: [bunExe(), "-e", script],
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "inherit",
+        env: { ...bunEnv, NSOLID_GRPC: undefined },
+      });
+      await using gateway = await grpcGateway([]);
+      await using traced = spawnAgent(gateway, script, { NSOLID_TRACING_ENABLED: "1" });
+      await spansUntil(gateway, spans => spans.find(span => span.name === "DNS lookup"));
+      const [withoutAgent, withTracing] = await Promise.all([looksOfOneLookup(plain), looksOfOneLookup(traced)]);
+      expect({ withTracing, looked: withoutAgent > 0 }).toEqual({ withTracing: withoutAgent, looked: true });
+    });
+
+    test.concurrent(
+      "of node:http and Bun.serve, which show the application what they show without the agent",
+      async () => {
+        // What a program can see of its exchanges: the listeners and keys of node:http's objects, the reads of a response
+        // and of the request's headers, and a Bun.serve handler made inside an AsyncLocalStorage context.
+        const script = `
+        const http = require("node:http");
+        const { AsyncLocalStorage } = require("node:async_hooks");
+        const seen = [];
+        const watch = (name, object) => {
+          seen.push(name + ": finish " + object.listenerCount("finish") + ", close " + object.listenerCount("close") +
+            ", end " + object.listenerCount("end") + ", keys " + Reflect.ownKeys(object).length);
+        };
+        const server = http.createServer((req, res) => {
+          if (req.url === "/warm") return res.end();
+          let headersSentReads = 0;
+          const { get } = Object.getOwnPropertyDescriptor(http.OutgoingMessage.prototype, "headersSent");
+          Object.defineProperty(res, "headersSent", { get() { headersSentReads++; return get.call(this); } });
+          seen.push("headers parsed before the handler: " + (Object.getOwnPropertySymbols(req)
+            .some(s => s.description === "kHeaders" && req[s] !== null)));
+          watch("server response", res);
+          res.on("close", () => seen.push("headersSent reads: " + headersSentReads));
+          res.end("ok");
+        });
+        const als = new AsyncLocalStorage();
+        const served = als.run("store", () => Bun.serve({ port: 0, fetch: () => new Response(String(als.getStore())) }));
+        server.listen(0, "127.0.0.1", () => {
+          const port = server.address().port;
+          // Exchanges that make spans, until stdin says to look at one.
+          const warm = setInterval(() => http.get({ host: "127.0.0.1", port, path: "/warm" }, res => res.resume()), 50);
+          process.stdin.once("data", () => {
+            clearInterval(warm);
+            const req = http.get({ host: "127.0.0.1", port, path: "/look" }, res => {
+              watch("client response", res);
+              res.resume();
+              res.on("end", async () => {
+                watch("client request", req);
+                seen.push("Bun.serve: " + (await (await fetch(served.url)).text()));
+                setImmediate(() => {
+                  console.log(JSON.stringify(seen));
+                  process.exit(0);
+                });
+              });
+            });
+          });
+        });`;
+        const whatItSees = async (proc: { stdin: Bun.FileSink; stdout: ReadableStream<Uint8Array> }) => {
+          proc.stdin.write("go\n");
+          proc.stdin.flush();
+          return JSON.parse(await lineReader(proc.stdout)());
+        };
+        await using plain = Bun.spawn({
+          cmd: [bunExe(), "-e", script],
+          stdin: "pipe",
+          stdout: "pipe",
+          stderr: "inherit",
+          env: { ...bunEnv, NSOLID_GRPC: undefined },
+        });
+        await using gateway = await grpcGateway([]);
+        await using traced = spawnAgent(gateway, script, { NSOLID_TRACING_ENABLED: "1" });
+        await spansUntil(gateway, spans => spans.find(span => span.attributes["nsolid.span_type"] === 8));
+        const [withoutAgent, withTracing] = await Promise.all([whatItSees(plain), whatItSees(traced)]);
+        expect(withTracing.toSorted()).toEqual(withoutAgent.toSorted());
+        expect(withoutAgent).toContain("Bun.serve: store");
+      },
+    );
 
     test.concurrent("sampled at the root with traceSampleRate, which reconfigure changes", async () => {
       await using gateway = await grpcGateway([]);

@@ -67,6 +67,7 @@ const {
   kOutHeaders,
   onDataIncomingMessage,
   http1ServerPipeline,
+  kHeaderSource,
 } = require("internal/http");
 const { FakeSocket } = require("internal/http/FakeSocket");
 const NumberIsNaN = Number.isNaN;
@@ -169,6 +170,11 @@ function assignSocketInternal(self, socket) {
   setCloseCallback(socket, onServerResponseClose);
   self.socket = socket;
   self.emit("socket", socket);
+}
+
+// For the N|Solid agent: a request's headers from what the native handle captured, which `req.headers` reads later.
+function headersOfRequest(req) {
+  return req[kHeaderSource]?.headersObject();
 }
 
 function onServerResponseClose() {
@@ -1129,7 +1135,7 @@ Server.prototype[kRealListen] = function (tls, port, host, socketPath, reusePort
           http_res.end();
         } else {
           // The N|Solid agent's span of the request is the active one while the listeners run.
-          const nsolidScope = nsolidHooks.httpServerRequest?.(http_req, http_res);
+          const nsolidScope = nsolidHooks.httpServerRequest?.(http_req, http_res, headersOfRequest);
           try {
             if (isHttp11 && (dispatchBits & DISPATCH_HAS_EXPECT) !== 0) {
               // Case-insensitive, token-boundary match like Node's
@@ -4170,8 +4176,15 @@ ServerResponse.prototype.emit = function (event) {
     }
     callCloseCallback(this);
   }
+  if (event === "finish" || event === "close")
+    nsolidHooks.httpServerResponseEnd?.(this, event === "close", headersSent);
   return Stream.prototype.emit.$apply(this, arguments);
 };
+
+// For the N|Solid agent, of a response it saw begin.
+function headersSent(res) {
+  return res[headerStateSymbol] === NodeHTTPHeaderState.sent;
+}
 
 function emitResponseFinishedThenClose(res, callback) {
   emitResponseFinished(res, callback);

@@ -388,48 +388,53 @@ function serveEnded(message: any) {
 }
 
 // node:http's server: around the 'request' event.
-function httpServerRequest(request: any, response: any): Disposable {
+// node:http keeps the agent's state of an exchange beside its objects, and calls the hooks below from its own code,
+// so that a program sees no listener, property or read of the agent's on them.
+const serverExchanges = new WeakMap<object, Exchange>();
+
+function httpServerRequest(
+  request: any,
+  response: any,
+  headersOf: (request: any) => Record<string, string> | undefined,
+): Disposable {
   const exchange: Exchange = { started: performance.now(), span: undefined };
-  let parent = ROOT_CONTEXT;
-  if ((traceFlags & SPAN_HTTP_SERVER) !== 0) {
-    parent = extract(request.headers?.traceparent);
-    const span = startSpan(`HTTP ${request.method}`, KIND_SERVER, SPAN_HTTP_SERVER, parent);
-    const protocol = request.socket?.encrypted ? "https:" : "http:";
-    span.setAttributes({
-      "http.method": request.method,
-      "network.protocol.version": request.httpVersion,
-      "http.url": `${protocol}//${request.headers?.host || "localhost"}${request.originalUrl || request.url}`,
-    });
-    exchange.span = span;
-  }
-  const end = () => {
-    if (exchange.ended) return;
-    exchange.ended = true;
-    const aborted = !response.writableFinished;
-    record(aborted ? Measure.HttpServerAbort : Measure.HttpServer, performance.now() - exchange.started);
-    const span = exchange.span;
-    if (span === undefined) return;
-    if (response.headersSent) {
-      span.setAttribute("http.status_code", response.statusCode);
-      // Node fills in the status code's text where the application gave none.
-      span.setAttribute(
-        "http.status_text",
-        response.statusMessage || require("node:http").STATUS_CODES[response.statusCode],
-      );
-    }
-    span.end();
-  };
-  response.once("finish", end);
-  response.once("close", end);
-  return exchange.span ? storage.withScope(withSpan(parent, exchange.span)) : NO_SCOPE;
+  serverExchanges.set(response, exchange);
+  if ((traceFlags & SPAN_HTTP_SERVER) === 0) return NO_SCOPE;
+  const headers = headersOf(request);
+  const parent = extract(headers?.traceparent);
+  const span = startSpan(`HTTP ${request.method}`, KIND_SERVER, SPAN_HTTP_SERVER, parent);
+  const protocol = request.socket?.encrypted ? "https:" : "http:";
+  span.setAttributes({
+    "http.method": request.method,
+    "network.protocol.version": request.httpVersion,
+    "http.url": `${protocol}//${headers?.host || "localhost"}${request.url}`,
+  });
+  exchange.span = span;
+  return storage.withScope(withSpan(parent, span));
 }
 
-// node:http's client, from its channels.
-const kClient = Symbol("nsolid.client");
+function httpServerResponseEnd(response: any, closed: boolean, headersSent: (response: any) => boolean) {
+  const exchange = serverExchanges.get(response);
+  if (exchange === undefined || exchange.ended) return;
+  exchange.ended = true;
+  record(closed ? Measure.HttpServerAbort : Measure.HttpServer, performance.now() - exchange.started);
+  const span = exchange.span;
+  if (span === undefined) return;
+  if (headersSent(response)) {
+    const { statusCode, statusMessage } = response;
+    span.setAttribute("http.status_code", statusCode);
+    // Node fills in the status code's text where the application gave none.
+    span.setAttribute("http.status_text", statusMessage || require("node:http").STATUS_CODES[statusCode]);
+  }
+  span.end();
+}
+
+// node:http's client, from its channels and httpClientResponseEnd.
+const clientExchanges = new WeakMap<object, Exchange>();
 
 function clientCreated({ request }: any) {
   const exchange: Exchange = { started: performance.now(), span: undefined };
-  request[kClient] = exchange;
+  clientExchanges.set(request, exchange);
   if ((traceFlags & SPAN_HTTP_CLIENT) === 0) return;
   const span = startSpan(`HTTP ${request.method}`, KIND_CLIENT, SPAN_HTTP_CLIENT);
   const host = request.getHeader?.("host") ?? request.host;
@@ -445,20 +450,24 @@ function clientCreated({ request }: any) {
 }
 
 function clientResponse({ request, response }: any) {
-  const exchange: Exchange | undefined = request[kClient];
+  const exchange = clientExchanges.get(request);
   if (exchange === undefined) return;
   record(Measure.HttpClient, performance.now() - exchange.started);
   const span = exchange.span;
   if (span === undefined) return;
   span.setAttribute("http.status_code", response.statusCode);
   span.setAttribute("http.status_text", response.statusMessage);
-  const end = () => span.end();
-  response.once("end", end);
-  response.once("close", end);
+}
+
+function httpClientResponseEnd(request: any) {
+  const exchange = clientExchanges.get(request);
+  if (exchange === undefined || exchange.ended) return;
+  exchange.ended = true;
+  exchange.span?.end();
 }
 
 function clientError({ request, error }: any) {
-  const exchange: Exchange | undefined = request[kClient];
+  const exchange = clientExchanges.get(request);
   if (exchange === undefined || exchange.ended) return;
   exchange.ended = true;
   record(Measure.HttpClientAbort, 0);
@@ -563,23 +572,26 @@ function traceQuery(operation: number, args: unknown[], promise: Promise<unknown
       span.setAttribute("dns.port", Number(args[1]));
     } else span.setAttribute("dns.hostname", String(args[0]));
   }
-  return promise.then(
+  // The query's own promise goes back, watched from the side: a promise resolved with the answer would look up a
+  // `then` on it once more, which code can see. node:dns chains on every query, so a rejection still reaches the
+  // promise the application holds.
+  promise.$then(
     result => {
       record(Measure.DnsDone, performance.now() - started);
-      if (span !== undefined) {
+      if (span === undefined) return;
+      try {
         if (operation === 0) span.setAttribute("dns.address", JSON.stringify(lookupAnswer(result, args[1])));
         else if (operation === 1) span.setAttribute("dns.hostname", String((result as unknown[])?.[0]));
         else span.setAttribute("dns.address", JSON.stringify(result));
-        span.end();
-      }
-      return result;
+      } catch {}
+      span.end();
     },
-    error => {
+    () => {
       record(Measure.DnsDone, performance.now() - started);
       span?.end();
-      throw error;
     },
   );
+  return promise;
 }
 
 // A lookup's answer as N|Solid records it: the address the caller gets (node:dns orders the resolver's list by the
@@ -602,6 +614,8 @@ function install() {
   serveStart.bindStore(storage, serveContextOf);
   diagnosticsChannel.subscribe("bun:serve:request:end", serveEnded);
   hooks.httpServerRequest = httpServerRequest;
+  hooks.httpServerResponseEnd = httpServerResponseEnd;
+  hooks.httpClientResponseEnd = httpClientResponseEnd;
   diagnosticsChannel.subscribe("http.client.request.created", clientCreated);
   diagnosticsChannel.subscribe("http.client.response.finish", clientResponse);
   diagnosticsChannel.subscribe("http.client.request.error", clientError);
