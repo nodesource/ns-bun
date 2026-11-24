@@ -196,6 +196,16 @@ export default {
       [1, "common", "grpcagent.CommonResponse", 0],
       [2, "body", "grpcagent.UnblockedLoopBody", 0],
     ],
+    "opentelemetry.proto.collector.metrics.v1.ExportMetricsPartialSuccess": [
+      [1, "rejected_data_points", "int64", 0],
+      [2, "error_message", "string", 0],
+    ],
+    "opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest": [
+      [1, "resource_metrics", "opentelemetry.proto.metrics.v1.ResourceMetrics", 1],
+    ],
+    "opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceResponse": [
+      [1, "partial_success", "opentelemetry.proto.collector.metrics.v1.ExportMetricsPartialSuccess", 0],
+    ],
     "opentelemetry.proto.common.v1.AnyValue": [
       [1, "string_value", "string", 2],
       [2, "bool_value", "bool", 2],
@@ -366,6 +376,14 @@ export default {
       ExportReconfigure: ["grpcagent.ReconfigureEvent", "grpcagent.EventResponse", false, false],
       ExportSourceCode: ["grpcagent.SourceCodeEvent", "grpcagent.EventResponse", false, false],
       ExportStartupTimes: ["grpcagent.StartupTimesEvent", "grpcagent.EventResponse", false, false],
+    },
+    "opentelemetry.proto.collector.metrics.v1.MetricsService": {
+      Export: [
+        "opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest",
+        "opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceResponse",
+        false,
+        false,
+      ],
     },
   },
 };

@@ -165,6 +165,18 @@ const answersOfNativeFunctions: readonly (readonly [b.BuiltinPath, b.TableType])
   [cpp("JSInspectorProfiler.cpp", "jsFunction_stopCPUProfiler"), b.string],
   [cpp("JSInspectorProfiler.cpp", "jsFunction_stopPreciseCoverage"), b.undefined],
   [cpp("NSolidAgent.cpp", "jsFunctionNSolidAgentId"), b.string],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidExitSent"), b.undefined],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidLoadedModules"), newArrayOf(b.string)],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidOnExit"), b.undefined],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidOnReply"), b.undefined],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidOnStart"), newArrayOf(b.string)],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidProcessStart"), b.f64],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidPublishConfig"), b.undefined],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidRequestLoadedModules"), b.bool],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidRequestThreadHeap"), b.bool],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidSharedConfig"), b.union(b.string, b.undefined)],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidStart"), b.bool],
+  [cpp("NSolidAgent.cpp", "jsFunctionNSolidThreads"), newArrayOf(b.plainData.fresh)],
   [cpp("Worker.cpp", "jsFunctionPostMessage"), b.undefined],
 ];
 

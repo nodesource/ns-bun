@@ -15,7 +15,8 @@ import { dirname, join, relative } from "node:path";
 const here = import.meta.dirname;
 const protoDir = join(here, "proto");
 const outFile = join(here, "..", "..", "src", "js", "internal", "nsolid", "messages.ts");
-const roots = ["nsolid_service.proto"];
+// The agent's service, and OTLP's metrics service on the same channel.
+const roots = ["nsolid_service.proto", "opentelemetry/proto/collector/metrics/v1/metrics_service.proto"];
 
 const scalars = new Set([
   "double",

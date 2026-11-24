@@ -24,6 +24,7 @@ const TRACING_MODULES: Record<string, number> = { dns: 1 << 0, http: (1 << 2) | 
 type Env = Record<string, string | undefined>;
 
 interface Config {
+  grpc: string | undefined;
   app: string;
   appVersion: string | undefined;
   hostname: string;
@@ -186,6 +187,7 @@ function createConfig(env: Env, mainPath: string): Config {
     DEFAULT_TRACE_SAMPLE_RATE;
 
   return {
+    grpc: withLocalhost(env.NSOLID_GRPC || nsolid.grpc),
     app: String(env.NSOLID_APPNAME || env.NSOLID_APP || nsolid.app || pkg.name || DEFAULT_APPNAME),
     appVersion: typeof pkg.version === "string" ? pkg.version : undefined,
     hostname: String(env.NSOLID_HOSTNAME || nsolid.hostname || os.hostname()),
@@ -255,6 +257,47 @@ function applyReconfigure(config: Config, body: Record<string, any> | undefined)
   if (Array.isArray(body.tags) && body.tags.length) config.tags = parseTags(body.tags);
 }
 
+// `nsolid.start(config)`: N|Solid's `updateConfig`. Each key given replaces
+// the one there, validated as N|Solid validates it; an address given as a port
+// means localhost.
+function applyUpdate(config: Config, update: Record<string, any> | undefined) {
+  if (!update || typeof update !== "object") return;
+  for (const key of Object.keys(update)) {
+    const value = update[key];
+    switch (key) {
+      case "__proto__":
+      case "constructor":
+        break;
+      case "tags":
+        config.tags = parseTags(value);
+        break;
+      case "statsd":
+      case "grpc":
+        (config as any)[key] = value ? withLocalhost(value) : value;
+        break;
+      case "contCpuProfile":
+        config.contCpuProfile = envToBool(value);
+        break;
+      case "contCpuProfileInterval":
+      case "interval":
+      case "assetsEnabled":
+      case "traceSampleRate": {
+        const parse = {
+          contCpuProfileInterval: parseContCpuProfileInterval,
+          interval: parseInterval,
+          assetsEnabled: optionToBool,
+          traceSampleRate: parseTraceSampleRate,
+        }[key];
+        const parsed = parse(value);
+        if (parsed !== undefined) (config as any)[key] = parsed;
+        break;
+      }
+      default:
+        (config as any)[key] = value;
+    }
+  }
+}
+
 // The whole configuration as a `ReconfigureBody`. The Console compares every
 // key it manages, so each is always reported; eBPF profiling is not available.
 function reconfigureBody(config: Config): Record<string, any> {
@@ -263,4 +306,4 @@ function reconfigureBody(config: Config): Record<string, any> {
   return body;
 }
 
-export default { createConfig, applyReconfigure, reconfigureBody };
+export default { createConfig, applyReconfigure, applyUpdate, reconfigureBody };

@@ -2,7 +2,7 @@ import * as grpc from "@grpc/grpc-js";
 import * as protoLoader from "@grpc/proto-loader";
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, tempDir, tls } from "harness";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -12,7 +12,7 @@ const COMMAND_PATH = "/grpcagent.NSolidService/Command";
 const UNTIL_STDIN_CLOSES = "for await (const _ of console) {}";
 
 // Stands in for the Console's gateway: answers the first Command stream it is
-// offered and hands it to the test.
+// offered and hands it to the test, and accepts every other call at once.
 async function fakeGateway() {
   const server = http2.createServer();
   const { promise: firstStream, resolve } = Promise.withResolvers<{
@@ -23,6 +23,10 @@ async function fakeGateway() {
   server.on("session", session => session.on("error", () => {}));
   server.on("stream", (stream, headers) => {
     stream.on("error", () => {});
+    if (headers[":path"] !== COMMAND_PATH) {
+      stream.respond({ ":status": 200, "content-type": "application/grpc", "grpc-status": "0" }, { endStream: true });
+      return;
+    }
     stream.respond({ ":status": 200, "content-type": "application/grpc" });
     resolve({ headers, stream });
   });
@@ -40,8 +44,8 @@ async function fakeGateway() {
 // Console's gateway: it sends `commands` on the Command stream and records
 // what the agent sends back on each RPC.
 const protoDir = join(import.meta.dir, "..", "..", "..", "..", "packages", "nsolid-protocol", "proto");
-const { grpcagent } = grpc.loadPackageDefinition(
-  protoLoader.loadSync("nsolid_service.proto", {
+const { grpcagent, opentelemetry } = grpc.loadPackageDefinition(
+  protoLoader.loadSync(["nsolid_service.proto", "opentelemetry/proto/collector/metrics/v1/metrics_service.proto"], {
     includeDirs: [protoDir],
     keepCase: true,
     longs: String,
@@ -59,6 +63,7 @@ async function grpcGateway(commands: object[]) {
   };
   let acks = 0;
   const { promise: commandMetadata, resolve: gotCommandStream } = Promise.withResolvers<grpc.Metadata>();
+  let commandCall: any;
   const unary = (rpc: string) => (call: any, callback: any) => {
     record(rpc, call.request);
     callback(null, {});
@@ -68,6 +73,7 @@ async function grpcGateway(commands: object[]) {
   server.addService(grpcagent.NSolidService.service, {
     Command(call: any) {
       gotCommandStream(call.metadata);
+      commandCall = call;
       call.on("data", () => acks++);
       call.on("error", () => {});
       for (const command of commands) call.write(command);
@@ -80,12 +86,16 @@ async function grpcGateway(commands: object[]) {
         callback(null, {});
       });
     },
+    ExportExit: unary("ExportExit"),
     ExportInfo: unary("ExportInfo"),
     ExportMetrics: unary("ExportMetrics"),
     ExportPackages: unary("ExportPackages"),
     ExportReconfigure: unary("ExportReconfigure"),
     ExportSourceCode: unary("ExportSourceCode"),
     ExportStartupTimes: unary("ExportStartupTimes"),
+  });
+  server.addService(opentelemetry.proto.collector.metrics.v1.MetricsService.service, {
+    Export: unary("MetricsExport"),
   });
   const port = await new Promise<number>((resolve, reject) =>
     server.bindAsync("127.0.0.1:0", grpc.ServerCredentials.createInsecure(), (err, port) =>
@@ -96,6 +106,11 @@ async function grpcGateway(commands: object[]) {
     port,
     commandMetadata,
     acks: () => acks,
+    // Sends one more command on the Command stream.
+    async command(command: object) {
+      await commandMetadata;
+      commandCall.write(command);
+    },
     next(rpc: string): Promise<any> {
       if (received[rpc]?.length) return Promise.resolve(received[rpc].shift());
       return new Promise(resolve => (waiting[rpc] ??= []).push(resolve));
@@ -121,7 +136,8 @@ interface CommandStream {
 }
 
 // A gateway, over TLS when given `secure` options, that records every
-// Command stream and lets `answer` respond to it.
+// Command stream and lets `answer` respond to it, and accepts every other
+// call at once.
 async function recordingGateway(
   answer: (command: CommandStream, index: number) => void,
   secure?: http2.SecureServerOptions,
@@ -132,6 +148,10 @@ async function recordingGateway(
   server.on("session", session => session.on("error", () => {}));
   server.on("stream", (stream, headers) => {
     stream.on("error", () => {});
+    if (headers[":path"] !== COMMAND_PATH) {
+      stream.respond({ ":status": 200, "content-type": "application/grpc", "grpc-status": "0" }, { endStream: true });
+      return;
+    }
     const peer = secure ? (stream.session?.socket as any)?.getPeerCertificate?.()?.subject?.CN : undefined;
     const command = { headers, stream, at: performance.now(), peer };
     seen.push(command);
@@ -170,6 +190,21 @@ async function readUntil(stream: ReadableStream<Uint8Array>, done: (text: string
     if (done(text)) break;
   }
   return text;
+}
+
+// The lines a child writes, one at a time.
+function lineReader(stream: ReadableStream<Uint8Array>) {
+  const lines = (async function* () {
+    const decoder = new TextDecoder();
+    let buffered = "";
+    for await (const chunk of stream) {
+      buffered += decoder.decode(chunk, { stream: true });
+      for (let end; (end = buffered.indexOf("\n")) !== -1; buffered = buffered.slice(end + 1)) {
+        yield buffered.slice(0, end);
+      }
+    }
+  })();
+  return async () => (await lines.next()).value as string;
 }
 
 function frame(payload: number[]) {
@@ -390,12 +425,269 @@ describe("N|Solid agent", () => {
       gateway.next("ExportSourceCode"),
     ]);
     expect(asset.map((m: any) => [m.common.requestId, m.common.error])).toEqual([["r-profile", notAvailable]]);
-    expect([packages, metrics, source].map(m => [m.common.requestId, m.common.error])).toEqual([
-      ["r-packages", notAvailable],
-      ["r-metrics", notAvailable],
-      ["r-source", notAvailable],
-    ]);
+    expect([source].map(m => [m.common.requestId, m.common.error])).toEqual([["r-source", notAvailable]]);
+    expect([packages.common.requestId, packages.common.error]).toEqual(["r-packages", undefined]);
+    expect({
+      requestId: metrics.common.requestId,
+      error: metrics.common.error,
+      resources: metrics.body.resource_metrics.length,
+    }).toEqual({ requestId: "r-metrics", error: undefined, resources: 1 });
     expect(gateway.acks()).toBe(7);
+  });
+
+  test.concurrent("exports the process's metrics and each thread's heap over OTLP every interval", async () => {
+    await using gateway = await grpcGateway([]);
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const { Worker } = require("node:worker_threads");
+         const worker = new Worker("setInterval(() => {}, 1000)", { eval: true, name: "w1" });
+         worker.on("online", () => console.log("online " + worker.threadId));
+         worker.on("exit", () => console.log("exited"));
+         for await (const line of console) if (line === "stop") worker.terminate();
+         worker.terminate();`,
+      ],
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "inherit",
+      env: {
+        ...bunEnv,
+        NSOLID_GRPC: `127.0.0.1:${gateway.port}`,
+        NSOLID_GRPC_INSECURE: "1",
+        NSOLID_APP: "metrics-app",
+        NSOLID_INTERVAL: "100",
+      },
+    });
+    const lines = (async function* () {
+      const decoder = new TextDecoder();
+      let buffered = "";
+      for await (const chunk of proc.stdout) {
+        buffered += decoder.decode(chunk, { stream: true });
+        for (let end; (end = buffered.indexOf("\n")) !== -1; buffered = buffered.slice(end + 1)) {
+          yield buffered.slice(0, end);
+        }
+      }
+    })();
+    const metricOf = (request: any, name: string) =>
+      request.resource_metrics[0].scope_metrics[0].metrics.find((m: any) => m.name === name);
+    const heapThreads = (request: any) =>
+      (metricOf(request, "heapUsed")?.gauge.data_points ?? []).map((p: any) =>
+        Object.fromEntries(p.attributes.map((a: any) => [a.key, a.value.int_value ?? a.value.string_value])),
+      );
+    const exportWhere = async (condition: (request: any) => boolean) => {
+      for (;;) {
+        const request = await gateway.next("MetricsExport");
+        if (condition(request)) return request;
+      }
+    };
+
+    // The agent's own VM does not take a thread id from the application's workers.
+    expect((await lines.next()).value).toBe("online 1");
+    const request = await exportWhere(r => heapThreads(r).some((t: any) => t["thread.id"] === "1"));
+    const [resourceMetrics] = request.resource_metrics;
+    const resource = Object.fromEntries(
+      resourceMetrics.resource.attributes.map((a: any) => [a.key, a.value.int_value ?? a.value.string_value]),
+    );
+    expect({
+      app: resource["service.name"],
+      agentId: resource["service.instance.id"],
+      pid: resource["process.pid"],
+      runtime: resource["process.runtime.name"],
+      scope: resourceMetrics.scope_metrics[0].scope.name,
+    }).toEqual({
+      app: "metrics-app",
+      agentId: (await gateway.commandMetadata).get("nsolid-agent-id")[0],
+      pid: String(proc.pid),
+      runtime: "bun",
+      scope: "nsolid",
+    });
+
+    const metrics = resourceMetrics.scope_metrics[0].metrics;
+    expect(metrics.map((m: any) => m.name).sort()).toEqual(
+      [
+        "blockInputOpCount",
+        "blockOutputOpCount",
+        "cpuPercent",
+        "cpuSystemPercent",
+        "cpuUserPercent",
+        "ctxSwitchInvoluntaryCount",
+        "ctxSwitchVoluntaryCount",
+        "externalMem",
+        "freeMem",
+        "heapTotal",
+        "heapUsed",
+        "ipcReceivedCount",
+        "ipcSentCount",
+        "load15m",
+        "load1m",
+        "load5m",
+        "pageFaultHardCount",
+        "pageFaultSoftCount",
+        "rss",
+        "signalCount",
+        "swapCount",
+        "systemUptime",
+        "totalMem",
+        "uptime",
+      ].sort(),
+    );
+    const uptime = metricOf(request, "uptime");
+    expect({ temporality: uptime.sum.aggregation_temporality, monotonic: uptime.sum.is_monotonic }).toEqual({
+      temporality: 2,
+      monotonic: true,
+    });
+    expect(Number(metricOf(request, "rss").gauge.data_points[0].as_int)).toBeGreaterThan(0);
+    expect(metricOf(request, "cpuPercent").gauge.data_points[0].as_double).toBeGreaterThanOrEqual(0);
+    expect(heapThreads(request).sort((a: any, b: any) => Number(a["thread.id"]) - Number(b["thread.id"]))).toEqual([
+      { "thread.id": "0", "thread.name": "" },
+      { "thread.id": "1", "thread.name": "" },
+    ]);
+    for (const p of metricOf(request, "heapUsed").gauge.data_points) expect(Number(p.as_int)).toBeGreaterThan(0);
+
+    proc.stdin.write("stop\n");
+    expect((await lines.next()).value).toBe("exited");
+    await exportWhere(r => heapThreads(r).every((t: any) => t["thread.id"] !== "1"));
+  });
+
+  test.concurrent("lists the packages the main script can require, and marks the ones it loaded", async () => {
+    await using gateway = await grpcGateway([]);
+    using dir = tempDir("nsolid-packages", {
+      "package.json": JSON.stringify({ name: "app" }),
+      "app.js": `require("a"); require("d"); console.log("loaded"); ${UNTIL_STDIN_CLOSES}`,
+      "node_modules/a/package.json": JSON.stringify({
+        name: "a",
+        version: "1.0.0",
+        main: "index.js",
+        dependencies: { c: "^3" },
+      }),
+      "node_modules/a/index.js": `module.exports = require("c");`,
+      "node_modules/a/node_modules/c/package.json": JSON.stringify({ name: "c", version: "3.0.0" }),
+      "node_modules/a/node_modules/c/index.js": `module.exports = "c";`,
+      "node_modules/@scope/b/package.json": JSON.stringify({ name: "@scope/b", version: "2.0.0" }),
+      "node_modules/.hidden/package.json": JSON.stringify({ name: "hidden" }),
+      // bun install's isolated linker: packages live under node_modules/.bun,
+      // linked by name where they are required from.
+      "node_modules/.bun/d@4.0.0/node_modules/d/package.json": JSON.stringify({
+        name: "d",
+        version: "4.0.0",
+        dependencies: { e: "^5" },
+      }),
+      "node_modules/.bun/d@4.0.0/node_modules/d/index.js": `module.exports = require("e");`,
+      "node_modules/.bun/e@5.0.0/node_modules/e/package.json": JSON.stringify({ name: "e", version: "5.0.0" }),
+      "node_modules/.bun/e@5.0.0/node_modules/e/index.js": `module.exports = "e";`,
+    });
+    const root = realpathSync(String(dir));
+    symlinkSync(join(root, "node_modules/.bun/d@4.0.0/node_modules/d"), join(root, "node_modules/d"), "dir");
+    symlinkSync(
+      join(root, "node_modules/.bun/e@5.0.0/node_modules/e"),
+      join(root, "node_modules/.bun/d@4.0.0/node_modules/e"),
+      "dir",
+    );
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), join(root, "app.js")],
+      cwd: root,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "inherit",
+      env: { ...bunEnv, NSOLID_GRPC: `127.0.0.1:${gateway.port}`, NSOLID_GRPC_INSECURE: "1" },
+    });
+    const reader = proc.stdout.getReader();
+    expect(new TextDecoder().decode((await reader.read()).value).trim()).toBe("loaded");
+
+    await gateway.command({ requestId: "r-packages", id: "x", command: "packages" });
+    const { body } = await gateway.next("ExportPackages");
+    const packages = body.packages
+      .filter((p: any) => p.path.startsWith(root))
+      .map((p: any) => ({
+        path: p.path.slice(root.length + 1),
+        name: p.name,
+        version: p.version,
+        dependencies: p.dependencies ?? [],
+        required: p.required ?? false,
+      }))
+      .sort((a: any, b: any) => a.path.localeCompare(b.path));
+    expect(packages).toEqual([
+      {
+        path: "node_modules/.bun/d@4.0.0/node_modules/e",
+        name: "e",
+        version: "5.0.0",
+        dependencies: [],
+        required: true,
+      },
+      { path: "node_modules/@scope/b", name: "@scope/b", version: "2.0.0", dependencies: [], required: false },
+      { path: "node_modules/a", name: "a", version: "1.0.0", dependencies: ["node_modules/c"], required: true },
+      { path: "node_modules/a/node_modules/c", name: "c", version: "3.0.0", dependencies: [], required: true },
+      {
+        path: "node_modules/d",
+        name: "d",
+        version: "4.0.0",
+        dependencies: ["../.bun/d@4.0.0/node_modules/e"],
+        required: true,
+      },
+    ]);
+  });
+
+  describe("reports the process's exit", () => {
+    const exitOf = async (script: string, end: (proc: Bun.Subprocess) => void) => {
+      await using gateway = await grpcGateway([{ requestId: "r-info", id: "x", command: "info" }]);
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "-e", script],
+        stdin: "pipe",
+        stdout: "ignore",
+        stderr: "ignore",
+        env: { ...bunEnv, NSOLID_GRPC: `127.0.0.1:${gateway.port}`, NSOLID_GRPC_INSECURE: "1" },
+      });
+      // Answering `info` means the agent is connected.
+      await gateway.next("ExportInfo");
+      end(proc);
+      const exit = await gateway.next("ExportExit");
+      await proc.exited;
+      return {
+        command: exit.common.command,
+        requestId: exit.common.requestId,
+        code: exit.body.code ?? 0,
+        signal: exit.body.signal ?? "",
+        error: exit.body.error,
+        exitCode: proc.exitCode,
+        signalCode: proc.signalCode,
+      };
+    };
+
+    test.concurrent("with its exit code", async () => {
+      const exit = await exitOf(`${UNTIL_STDIN_CLOSES}; process.exitCode = 3;`, proc => proc.stdin!.end());
+      expect(exit.requestId).toMatch(/^[0-9a-f]{40}$/);
+      expect({ ...exit, requestId: undefined }).toEqual({
+        command: "exit",
+        requestId: undefined,
+        code: 3,
+        signal: "",
+        error: undefined,
+        exitCode: 3,
+        signalCode: null,
+      });
+    });
+
+    test.concurrent("with the uncaught exception it ends with", async () => {
+      const exit = await exitOf(`${UNTIL_STDIN_CLOSES}; setTimeout(() => { throw new Error("boom"); });`, proc =>
+        proc.stdin!.end(),
+      );
+      expect({ code: exit.code, message: exit.error?.message, exitCode: exit.exitCode }).toEqual({
+        code: 1,
+        message: "Uncaught Error: boom",
+        exitCode: 1,
+      });
+      expect(exit.error.stack).toStartWith("Error: boom\n");
+    });
+
+    test.concurrent("with the signal that ends it", async () => {
+      const exit = await exitOf(UNTIL_STDIN_CLOSES, proc => proc.kill("SIGTERM"));
+      expect({ code: exit.code, signal: exit.signal, signalCode: exit.signalCode }).toEqual({
+        code: 15,
+        signal: "SIGTERM",
+        signalCode: "SIGTERM",
+      });
+    });
   });
 
   test.concurrent("reads its configuration with N|Solid's precedence and validation", async () => {
@@ -641,6 +933,123 @@ describe("N|Solid agent", () => {
     await gateway.until(seen => seen.length >= 2);
     expect(gateway.seen[1].at - gateway.seen[0].at).toBeGreaterThanOrEqual(950);
   });
+
+  test.concurrent("nsolid is start(), with N|Solid's id, config, info, metrics and packages", async () => {
+    using dir = tempDir("nsolid-api", {
+      "package.json": JSON.stringify({ name: "api-app", version: "2.0.0" }),
+      "node_modules/a/package.json": JSON.stringify({ name: "a", version: "1.0.0" }),
+      "node_modules/a/index.js": "module.exports = 1;",
+      "node_modules/b/package.json": JSON.stringify({ name: "b", version: "1.0.0" }),
+      "app.js": `
+        require("a");
+        const nsolid = require("nsolid");
+        const returned = nsolid.start({ app: "via-start", tags: "aa, bb", interval: 0, hostname: "h1" });
+        const info = nsolid.info();
+        const metrics = nsolid.metrics();
+        const root = require("path").dirname(Bun.main);
+        nsolid.info((err, viaCallback) => {
+          console.log(JSON.stringify({
+            isStart: typeof nsolid === "function" && returned === nsolid && nsolid.start === nsolid,
+            app: nsolid.app,
+            appName: nsolid.appName,
+            appVersion: nsolid.appVersion,
+            tags: nsolid.tags,
+            interval: nsolid.config.interval,
+            hostname: nsolid.config.hostname,
+            flags: [nsolid.metricsPaused, nsolid.assetsEnabled, nsolid.tracingEnabled],
+            info: {
+              sameId: info.id === nsolid.id,
+              app: info.app,
+              appVersion: info.appVersion,
+              pid: info.pid === process.pid,
+              main: info.main === Bun.main,
+              node: info.versions.node ?? null,
+              bun: info.versions.bun === Bun.version,
+            },
+            metrics: {
+              threadId: metrics.threadId,
+              heap: metrics.heapUsed > 0 && metrics.heapTotal > 0,
+              rss: metrics.rss > 0,
+              cpu: metrics.cpu === metrics.cpuPercent,
+            },
+            packages: nsolid
+              .packages()
+              .filter(p => p.path.startsWith(root))
+              .map(p => [p.name, p.required])
+              .sort(),
+            callback: err === null && viaCallback.id === nsolid.id,
+          }));
+        });`,
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), join(String(dir), "app.js")],
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "inherit",
+      env: bunEnv,
+    });
+    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+    expect(JSON.parse(stdout)).toEqual({
+      isStart: true,
+      app: "via-start",
+      appName: "via-start",
+      appVersion: "2.0.0",
+      tags: ["aa", "bb"],
+      interval: 5000,
+      hostname: "h1",
+      flags: [false, true, false],
+      info: { sameId: true, app: "via-start", appVersion: "2.0.0", pid: true, main: true, node: null, bun: true },
+      metrics: { threadId: 0, heap: true, rss: true, cpu: true },
+      packages: [
+        ["a", true],
+        ["b", false],
+      ],
+      callback: true,
+    });
+    expect(exitCode).toBe(0);
+  });
+
+  test.concurrent(
+    "start({ grpc }) starts the agent, which then takes start(config) and publishes the Console's reconfigure",
+    async () => {
+      await using gateway = await grpcGateway([]);
+      await using proc = Bun.spawn({
+        cmd: [
+          bunExe(),
+          "-e",
+          `const nsolid = require("nsolid");
+         nsolid.start({ grpc: "127.0.0.1:${gateway.port}", app: "started-by-script" });
+         for await (const line of console) {
+           if (line === "rename") nsolid.start({ app: "renamed" });
+           if (line === "config") console.log(JSON.stringify({ interval: nsolid.config.interval, app: nsolid.app }));
+         }`,
+        ],
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "inherit",
+        env: { ...bunEnv, NSOLID_GRPC_INSECURE: "1" },
+      });
+      const nextLine = lineReader(proc.stdout);
+      const appOfInfo = async () => {
+        await gateway.command({ requestId: "r-info", id: "x", command: "info" });
+        return (await gateway.next("ExportInfo")).body.app;
+      };
+
+      expect(await appOfInfo()).toBe("started-by-script");
+      proc.stdin.write("rename\n");
+      while ((await appOfInfo()) !== "renamed");
+
+      await gateway.command({
+        requestId: "r-reconfigure",
+        id: "x",
+        command: "reconfigure",
+        args: { reconfigure: { interval: 7000 } },
+      });
+      await gateway.next("ExportReconfigure");
+      proc.stdin.write("config\n");
+      expect(JSON.parse(await nextLine())).toEqual({ interval: 7000, app: "renamed" });
+    },
+  );
 
   test.concurrent("nsolid and bun:nsolid are the same module, with the process's id", async () => {
     await using proc = Bun.spawn({

@@ -1044,6 +1044,7 @@ impl WebWorker {
 
         // 'online' before the entry runs, as in node: it precedes anything the entry posts.
         WebWorker__workerThreadStarted(self.messaging_proxy);
+        crate::nsolid_agent::register_thread(self.execution_context_id);
 
         // `preloads` is owned by `self` (heap `WebWorker` outlives the VM).
         // `preload: Vec<Box<[u8]>>` — clone the boxes (cheap, ≤handful).
@@ -1254,6 +1255,7 @@ impl WebWorker {
         self.set_status(Status::Terminated);
         bun_analytics::features::workers_terminated.fetch_add(1, Ordering::Relaxed);
         log!("[{}] shutdown", self.execution_context_id);
+        crate::nsolid_agent::unregister_thread(self.execution_context_id);
 
         // ---- 1. Unpublish vm ------------------------------------------------
         drop(self.vm_handle.lock().take());
