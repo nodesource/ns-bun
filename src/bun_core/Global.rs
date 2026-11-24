@@ -487,6 +487,22 @@ pub const NSOLID_BUN: bool = true;
 /// `process.versions.nsolid_bun`, beside Bun's.
 pub const nsolid_bun_version: &str = "0.1.0";
 
+/// Reports a crash to the N|Solid Console: the signal the process ends with,
+/// the crash's reason, and its trace string. The crash handler calls it from
+/// the one thread left reporting; it returns once the report is sent, or
+/// after a timeout.
+pub type CrashReport = fn(signal: c_int, reason: &[u8], trace: &[u8]);
+static CRASH_REPORT: crate::util::Once<CrashReport> = crate::util::Once::new();
+
+/// Set by the N|Solid agent (src/jsc/nsolid_agent.rs) when it starts.
+pub fn set_crash_report(report: CrashReport) {
+    CRASH_REPORT.get_or_init(|| report);
+}
+
+pub fn crash_report() -> Option<CrashReport> {
+    CRASH_REPORT.get().copied()
+}
+
 /// What `bun --version` prints: "1.4.6 (nsolid-bun 0.1.0)".
 pub const version_line_nl: &str = concatcp!(
     package_json_version,

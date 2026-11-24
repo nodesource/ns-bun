@@ -357,6 +357,9 @@ extern "C" bool Bun__isOptionThatCompiledCodeDoesNotTake(const char* entry)
 }
 #endif
 
+// Runs work the N|Solid agent queued for a thread busy in JS (NSolidAgent.cpp).
+void Bun__NSolid__onShellTimeoutCheck(JSC::VM&);
+
 extern "C" void JSCInitialize(const char* envp[], size_t envc, void (*onCrash)(const char* ptr, size_t length), bool evalMode, bool oneShotStartup, bool shortLivedGlobals, bool runsCompiledCode, bool locksBuiltins, bool isCompiler)
 {
     static std::once_flag jsc_init_flag;
@@ -388,6 +391,7 @@ extern "C" void JSCInitialize(const char* envp[], size_t envc, void (*onCrash)(c
 #endif
         JSC::MarkedBlockCage::setLastReserveHandler([](JSC::VM&) { WebWorker__endForExhaustedHeap(Bun__getVM()); });
         JSC::initialize([&] {
+            g_jscConfig.shellTimeoutCheckCallback = Bun__NSolid__onShellTimeoutCheck;
 #if defined(BUN_DISABLE_WEBASSEMBLY)
             JSC::Options::useWasm() = false;
 #else

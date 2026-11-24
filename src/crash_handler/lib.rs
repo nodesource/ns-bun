@@ -1196,6 +1196,17 @@ mod draft {
                 // This is important so that we do not try to run the following reload logic twice.
                 wait_for_other_thread_to_finish_panicking();
 
+                #[cfg(unix)]
+                if let Some(report_to_console) = Global::crash_report() {
+                    let mut message = BoundedArray::<u8, 1024>::default();
+                    let _ = write!(message.writer(), "{reason}");
+                    report_to_console(
+                        reason.terminal_signal(),
+                        message.const_slice(),
+                        trace_str_buf.const_slice(),
+                    );
+                }
+
                 report(trace_str_buf.const_slice());
 
                 // At this point, the crash handler has performed it's job. Reset the segfault handler

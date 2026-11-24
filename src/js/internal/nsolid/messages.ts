@@ -36,6 +36,10 @@ export default {
       [2, "body", "grpcagent.BlockedLoopBody", 0],
     ],
     "grpcagent.CPUProfileArgs": [],
+    "grpcagent.Capabilities": [
+      [1, "commands", "string", 1],
+      [2, "settings", "string", 1],
+    ],
     "grpcagent.CommandArgs": [
       [1, "reconfigure", "grpcagent.ReconfigureBody", 2],
       [2, "profile", "grpcagent.ProfileArgs", 2],
@@ -104,6 +108,8 @@ export default {
       [15, "versions", "string", 4, "string"],
       [16, "kernelVersion", "uint32", 0],
       [17, "appVersion", "string", 2],
+      [18, "runtime", "grpcagent.RuntimeInfo", 2],
+      [19, "capabilities", "grpcagent.Capabilities", 2],
     ],
     "grpcagent.InfoEvent": [
       [1, "common", "grpcagent.CommonResponse", 0],
@@ -157,6 +163,12 @@ export default {
     "grpcagent.ReconfigureEvent": [
       [1, "common", "grpcagent.CommonResponse", 0],
       [2, "body", "grpcagent.ReconfigureBody", 0],
+    ],
+    "grpcagent.RuntimeInfo": [
+      [1, "name", "string", 0],
+      [2, "version", "string", 0],
+      [3, "engine", "string", 0],
+      [4, "agent_version", "string", 0],
     ],
     "grpcagent.SourceCodeArgs": [
       [1, "thread_id", "int64", 0],

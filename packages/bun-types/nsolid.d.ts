@@ -113,6 +113,18 @@ declare module "bun:nsolid" {
     }
 
     type Callback<T> = (error: null, value: T) => void;
+
+    /**
+     * What a profile or snapshot call failed with: N|Solid's message, and as
+     * `code` N|Solid's status (404 with no agent, 409 while one runs on the
+     * thread, 500 with assets or snapshots turned off).
+     */
+    interface AssetError extends Error {
+      code: number;
+    }
+
+    /** Called on the next tick, with an error if the call failed. */
+    type AssetCallback = (error?: AssetError) => void;
   }
 
   interface NSolid {
@@ -143,6 +155,31 @@ declare module "bun:nsolid" {
     metrics(callback: nsolid.Callback<nsolid.Metrics>): void;
     packages(): nsolid.Package[];
     packages(callback: nsolid.Callback<nsolid.Package[]>): void;
+    /**
+     * Starts a CPU profile of the calling thread for `timeout` ms (10 minutes
+     * by default), or until `profileEnd()`. The agent sends it to the N|Solid
+     * Console. Without a callback, a failure throws.
+     */
+    profile(timeout?: number, callback?: nsolid.AssetCallback): void;
+    profile(callback: nsolid.AssetCallback): void;
+    /** Ends the calling thread's profile, which the agent then sends. */
+    profileEnd(callback?: nsolid.AssetCallback): void;
+    /** Takes a heap snapshot of the calling thread, which the agent sends. */
+    snapshot(callback?: nsolid.AssetCallback): void;
+    /** Not available on Bun: fails with status 404. */
+    heapProfile(timeout?: number, trackAllocations?: boolean, callback?: nsolid.AssetCallback): void;
+    heapProfile(callback: nsolid.AssetCallback): void;
+    /** Not available on Bun: fails with status 404. */
+    heapProfileEnd(callback?: nsolid.AssetCallback): void;
+    /** Not available on Bun: fails with status 404. */
+    heapSampling(duration?: number, options?: object, callback?: nsolid.AssetCallback): void;
+    heapSampling(callback: nsolid.AssetCallback): void;
+    /** Not available on Bun: fails with status 404. */
+    heapSamplingEnd(callback?: nsolid.AssetCallback): void;
+    /** Turns on profiles and snapshots, from the Console and from code. */
+    enableAssets(): void;
+    /** Turns off profiles and snapshots, from the Console and from code. */
+    disableAssets(): void;
   }
 
   const nsolid: NSolid;

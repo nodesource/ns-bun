@@ -21,6 +21,7 @@ const requests = require("internal/nsolid/requests");
 const nsolidPackages = require("internal/nsolid/packages");
 const nsolidInfo = require("internal/nsolid/info");
 const otlp = require("internal/nsolid/otlp");
+const profiles = require("internal/nsolid/profiles");
 
 const onExit = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidOnExit", 1);
 const exitSent = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidExitSent", 0);
@@ -28,6 +29,13 @@ const publishConfig = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidPublis
 const onStart = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidOnStart", 1);
 const processStart = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidProcessStart", 0);
 const requestLoadedModules = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidRequestLoadedModules", 2);
+const nsolidThreads = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidThreads", 0);
+const startProfile = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidStartProfile", 2);
+const stopProfile = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidStopProfile", 2);
+const takeSnapshot = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidTakeSnapshot", 4);
+const checkLoops = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidCheckLoops", 1);
+const loopStack = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidLoopStack", 2);
+const onApiCommand = $newCppFunction("NSolidAgent.cpp", "jsFunctionNSolidOnApiCommand", 1);
 
 // The main thread's `ScriptExecutionContext` identifier: its packages are the
 // ones reported, as in N|Solid.
@@ -52,8 +60,37 @@ const GRPC_UNKNOWN = 2;
 const GRPC_UNAVAILABLE = 14;
 const GRPC_UNAUTHENTICATED = 16;
 const EMPTY_FRAME = protobuf.frame(new Uint8Array(0));
-// N|Solid's ENotAvailable: what the agent answers for what it can't provide.
-const NOT_AVAILABLE = { code: 404, message: "Resource not available" };
+// N|Solid's errors (agents/grpc/src/grpc_errors.h). NOT_AVAILABLE is what the
+// agent answers for what it can't provide.
+const IN_PROGRESS = { code: 409, message: "Operation already in progress(1001)" };
+const THREAD_GONE = { code: 410, message: "Thread already gone(1002)" };
+const ASSET_FAILED = { code: 500, message: "Profile/Snapshot creation failure(1003)" };
+const SNAPSHOTS_DISABLED = { code: 500, message: "Heap Snapshots disabled(1004)" };
+const OUT_OF_MEMORY = { code: 500, message: "Internal Runtime Error(1005)" };
+const NOT_AVAILABLE = { code: 404, message: "Resource not available(1006)" };
+const ASSETS_DISABLED = { code: 500, message: "Assets collection disabled(1008)" };
+// An asset goes to the Console in chunks of this many bytes.
+const ASSET_CHUNK_BYTES = 1 << 20;
+// How long a thread may take to start or stop a profile: a thread in a long
+// native call answers only once it is back in JS.
+const PROFILE_START_TIMEOUT_MS = 10_000;
+const PROFILE_STOP_TIMEOUT_MS = 60_000;
+// How long a thread may take to answer with a heap snapshot: a large heap
+// takes minutes. The Console waits 15.
+const SNAPSHOT_TIMEOUT_MS = 10 * 60_000;
+// N|Solid checks the threads' loops this often for one blocked past
+// `blockedLoopThreshold`. A blocked thread's stack that has not come within
+// BLOCKED_LOOP_STACK_WAIT_MS is sent empty: the thread is blocked outside
+// JavaScript, where N|Solid would send no event at all.
+const BLOCKED_LOOP_INTERVAL_MS = 100;
+const BLOCKED_LOOP_STACK_WAIT_MS = 1000;
+
+// What the agent does, as `InfoBody.capabilities` reports it: the commands it
+// answers, and the `ReconfigureBody` settings it applies.
+const CAPABILITIES = {
+  commands: ["info", "metrics", "packages", "profile", "reconfigure", "snapshot", "startup_times"],
+  settings: ["assetsEnabled", "blockedLoopThreshold", "interval", "pauseMetrics", "redactSnapshots", "tags"],
+};
 
 // The RPC that carries each command's answer.
 const replyRpc: Record<string, string> = {
@@ -79,6 +116,13 @@ interface StartupMarks {
   mainEntryNs: number;
   agentThreadNs: number;
   agentVmNs: number;
+}
+
+// A running JavaScript thread by its id (0 for the main thread).
+function threadOf(threadId: number): { contextId: number; threadId: number; name: string } | undefined {
+  return (nsolidThreads() as { contextId: number; threadId: number; name: string }[]).find(
+    thread => thread.threadId === threadId,
+  );
 }
 
 function warn(message: string) {
@@ -267,6 +311,12 @@ class Agent {
   // The last periodic sample, which the `metrics` command answers with, as
   // N|Solid does: CPU percentages stay measured over a whole interval.
   lastMetrics: object | undefined;
+  // The CPU profiles running for the Console, by thread id.
+  profiles = new Map<number, { request; receivedAt: number }>();
+  // The threads a heap snapshot is being taken of.
+  snapshots = new Set<number>();
+  // Each thread's blocked-loop events, sent in order.
+  loopEvents = new Map<number, Promise<void>>();
   inventory;
   // One `packages` answer at a time: a second waits for the scan the first started.
   packagesRun: Promise<unknown> = Promise.resolve();
@@ -314,6 +364,44 @@ class Agent {
     const { saasToken } = endpoint;
     if (saasToken) this.metadata["nsolid-saas"] = saasToken;
     this.scheduleMetrics();
+    setInterval(() => this.checkLoops(), BLOCKED_LOOP_INTERVAL_MS);
+  }
+
+  // N|Solid's blocked-loop watchdog: `loop_blocked` once a thread's loop has
+  // run one iteration for `blockedLoopThreshold` ms, with the thread's stack,
+  // then `loop_unblocked` with how long that iteration ran.
+  checkLoops() {
+    const { loopEvents } = this;
+    for (const event of checkLoops(this.config.blockedLoopThreshold)) {
+      const { threadId } = event;
+      const body = {
+        thread_id: threadId,
+        blocked_for: event.blockedFor,
+        loop_id: event.loopId,
+        callback_cntr: event.callbacks,
+      };
+      const common = {
+        requestId: crypto.randomBytes(20).toString("hex"),
+        command: event.blocked ? "loop_blocked" : "loop_unblocked",
+        recorded: recorded(),
+      };
+      const stack = event.blocked
+        ? requests.ask(loopStack, event.contextId, BLOCKED_LOOP_STACK_WAIT_MS)
+        : Promise.resolve(undefined);
+      const previous = loopEvents.get(threadId) ?? Promise.resolve();
+      const sent = previous
+        .then(() => stack)
+        .then(frames =>
+          event.blocked
+            ? this.send("ExportBlockedLoop", { common, body: { ...body, stack: frames ?? [] } })
+            : this.send("ExportUnblockedLoop", { common, body }),
+        )
+        .catch((err: Error) => $debug("loop event failed:", err?.message));
+      loopEvents.set(threadId, sent);
+      sent.then(() => {
+        if (loopEvents.get(threadId) === sent) loopEvents.delete(threadId);
+      });
+    }
   }
 
   // Metrics go to the Console every `interval` over OTLP, unless paused.
@@ -462,6 +550,11 @@ class Agent {
   // Sends one message on a unary or client-streaming RPC, and waits for the
   // call to end.
   send(rpc: string, message: object, service: string = SERVICE): Promise<void> {
+    return this.sendStream(rpc, [message], service);
+  }
+
+  // Sends messages on a client-streaming RPC, and waits for the call to end.
+  sendStream(rpc: string, messages: object[], service: string = SERVICE): Promise<void> {
     const session = this.session;
     if (!session || session.closed || session.destroyed) return Promise.resolve();
     const [type] = protobuf.services[service][rpc];
@@ -480,21 +573,170 @@ class Agent {
       if (status !== undefined && status !== "0") $debug(`${rpc} answered grpc-status ${status}`);
       resolve();
     });
-    stream.end(protobuf.frame(protobuf.encode(type, message)));
+    for (const message of messages) stream.write(protobuf.frame(protobuf.encode(type, message)));
+    stream.end();
     return promise;
+  }
+
+  // An asset (a CPU profile, a heap snapshot) for a command: its data in
+  // chunks on one `ExportAsset` stream, then a message that marks it complete
+  // with the milliseconds since the command arrived. Each message carries the
+  // request's id, thread and metadata, as N|Solid's do. `data` may come in
+  // chunks already.
+  sendAsset(request, threadId: number, data: Uint8Array | Uint8Array[], durationMs: number) {
+    const base = { common: this.common(request), thread_id: threadId, metadata: request.args?.profile?.metadata };
+    const messages: object[] = [];
+    for (const chunk of $isArray(data) ? data : [data]) {
+      for (let offset = 0; offset < chunk.length; offset += ASSET_CHUNK_BYTES) {
+        messages.push({ ...base, data: chunk.subarray(offset, offset + ASSET_CHUNK_BYTES) });
+      }
+    }
+    messages.push({ ...base, complete: true, duration: Math.max(0, Math.round(durationMs)) });
+    return this.sendStream("ExportAsset", messages);
+  }
+
+  sendAssetError(request, threadId: number, error: { code: number; message: string }) {
+    return this.send("ExportAsset", {
+      common: this.common(request, error),
+      thread_id: threadId,
+      metadata: request.args?.profile?.metadata,
+    });
+  }
+
+  // The `profile` command: a CPU profile of one thread for `duration` ms,
+  // with N|Solid's checks in N|Solid's order.
+  async profile(request) {
+    const args = request.args?.profile ?? {};
+    const threadId = Number(args.thread_id ?? 0);
+    const receivedAt = performance.now();
+    if (this.config.assetsEnabled === false) return this.sendAssetError(request, threadId, ASSETS_DISABLED);
+    if (this.config.contCpuProfile || this.profiles.has(threadId)) {
+      return this.sendAssetError(request, threadId, IN_PROGRESS);
+    }
+    const thread = threadOf(threadId);
+    if (!thread) return this.sendAssetError(request, threadId, THREAD_GONE);
+    const entry = { request, receivedAt };
+    this.profiles.set(threadId, entry);
+    const started = await requests.ask(startProfile, thread.contextId, PROFILE_START_TIMEOUT_MS);
+    if (started?.inUse || (!started && !threadOf(threadId))) {
+      this.profiles.delete(threadId);
+      return this.sendAssetError(request, threadId, started ? IN_PROGRESS : THREAD_GONE);
+    }
+    // A profile that started late still stops on time.
+    const stopIn = receivedAt + Number(args.duration ?? 0) - performance.now();
+    setTimeout(
+      () => {
+        this.finishProfile(threadId, thread.contextId).catch((err: Error) => $debug("profile failed:", err?.message));
+      },
+      Math.max(0, stopIn),
+    );
+  }
+
+  async finishProfile(threadId: number, contextId: number) {
+    const entry = this.profiles.get(threadId);
+    if (!entry) return;
+    const answer = await requests.ask(stopProfile, contextId, PROFILE_STOP_TIMEOUT_MS);
+    // The process's exit may have sent it meanwhile.
+    if (this.profiles.get(threadId) !== entry) return;
+    this.profiles.delete(threadId);
+    if (!answer?.profile) return this.sendAssetError(entry.request, threadId, ASSET_FAILED);
+    return this.sendProfile(entry, threadId, answer);
+  }
+
+  // The `snapshot` command: a heap snapshot of one thread, redacted if the
+  // request or the `redactSnapshots` setting asks for it, with N|Solid's
+  // checks in N|Solid's order.
+  async snapshot(request) {
+    const args = request.args?.profile ?? {};
+    const threadId = Number(args.thread_id ?? 0);
+    const receivedAt = performance.now();
+    if (this.config.assetsEnabled === false) return this.sendAssetError(request, threadId, ASSETS_DISABLED);
+    if (this.config.disableSnapshots) return this.sendAssetError(request, threadId, SNAPSHOTS_DISABLED);
+    if (this.snapshots.has(threadId)) return this.sendAssetError(request, threadId, IN_PROGRESS);
+    const thread = threadOf(threadId);
+    if (!thread) return this.sendAssetError(request, threadId, THREAD_GONE);
+    const redact = !!args.heap_snapshot?.redacted || !!this.config.redactSnapshots;
+    this.snapshots.add(threadId);
+    let answer: { chunks?: Uint8Array[]; error?: string } | undefined;
+    try {
+      answer = await requests.ask(
+        (contextId: number, requestId: number) => takeSnapshot(contextId, requestId, redact, ASSET_CHUNK_BYTES),
+        thread.contextId,
+        SNAPSHOT_TIMEOUT_MS,
+      );
+    } finally {
+      this.snapshots.delete(threadId);
+    }
+    if (answer?.error === "memory") return this.sendAssetError(request, threadId, OUT_OF_MEMORY);
+    if (!answer?.chunks) {
+      return this.sendAssetError(request, threadId, threadOf(threadId) ? ASSET_FAILED : THREAD_GONE);
+    }
+    return this.sendAsset(request, threadId, answer.chunks, performance.now() - receivedAt);
+  }
+
+  // `nsolid.profile()`, `nsolid.snapshot()` and `nsolid.profileEnd()` from a
+  // thread's code: taken and sent as the Console's commands are, marked as
+  // N|Solid marks them.
+  apiCommand(command: string, threadId: number, value) {
+    const requestId = crypto.randomBytes(20).toString("hex");
+    const metadata = { fields: { reason: { string_value: "Agent API" } } };
+    const failed = (err: Error) => $debug(`${command} from the API failed:`, err?.message);
+    switch (command) {
+      case "profile":
+        return this.profile({
+          requestId,
+          command,
+          args: { profile: { thread_id: threadId, duration: value, metadata, cpu_profile: {} } },
+        }).catch(failed);
+      case "snapshot":
+        return this.snapshot({
+          requestId,
+          command,
+          args: { profile: { thread_id: threadId, metadata, heap_snapshot: {} } },
+        }).catch(failed);
+      case "profileEnd": {
+        const entry = this.profiles.get(threadId);
+        if (!entry || !value) return;
+        this.profiles.delete(threadId);
+        return this.sendProfile(entry, threadId, value).catch(failed);
+      }
+    }
+  }
+
+  sendProfile(entry: { request; receivedAt: number }, threadId: number, answer) {
+    const profile = profiles.completeProfile(answer.profile, answer.stoppedAt, answer.collections, answer.waits);
+    return this.sendAsset(entry.request, threadId, Buffer.from(profile), performance.now() - entry.receivedAt);
   }
 
   // The process is ending; the thread it ends on waits for `exitSent()`, 5
   // seconds at most. Like N|Solid, an agent that is not connected sends
   // nothing.
-  reportExit(code: number, signal: string | undefined, message: string | undefined, stack: string | undefined) {
+  // `mainProfile` is the main thread's running profile, which ended with it:
+  // like N|Solid, the agent sends it first and names it in the exit.
+  reportExit(
+    code: number,
+    signal: string | undefined,
+    message: string | undefined,
+    stack: string | undefined,
+    mainProfile: { profile: string; stoppedAt: number; collections: number[]; waits: number[] } | undefined,
+  ) {
     if (!this.connected) return exitSent();
     const common = { requestId: crypto.randomBytes(20).toString("hex"), command: "exit", recorded: recorded() };
     const error = message === undefined ? undefined : { message, stack: stack ?? "" };
-    this.send("ExportExit", { common, body: { code, signal: signal ?? "", error, profile: "" } }).then(
-      () => exitSent(),
-      () => exitSent(),
-    );
+    const entry = this.profiles.get(0);
+    let profileSent = Promise.resolve();
+    let profile = "";
+    if (mainProfile && entry) {
+      this.profiles.delete(0);
+      profile = entry.request.requestId;
+      profileSent = this.sendProfile(entry, 0, mainProfile).catch(() => {});
+    }
+    profileSent
+      .then(() => this.send("ExportExit", { common, body: { code, signal: signal ?? "", error, profile } }))
+      .then(
+        () => exitSent(),
+        () => exitSent(),
+      );
   }
 
   common(request, error?: { code: number; message: string }) {
@@ -531,6 +773,10 @@ class Agent {
         const resourceMetrics = this.lastMetrics ?? (await this.collectMetrics());
         return this.send(rpc, { common: this.common(request), body: { resource_metrics: [resourceMetrics] } });
       }
+      case "profile":
+        return this.profile(request);
+      case "snapshot":
+        return this.snapshot(request);
       default: {
         const message: Record<string, any> = { common: this.common(request, NOT_AVAILABLE) };
         if (rpc === "ExportAsset") message.thread_id = request.args?.profile?.thread_id ?? 0;
@@ -540,7 +786,11 @@ class Agent {
   }
 
   info() {
-    return nsolidInfo.infoObject(this.config, this.agentId, this.processStartMs);
+    return {
+      ...nsolidInfo.infoObject(this.config, this.agentId, this.processStartMs),
+      runtime: { name: "bun", version: Bun.version, engine: "jsc", agent_version: process.versions.nsolid_bun },
+      capabilities: CAPABILITIES,
+    };
   }
 
   // `nsolid.start(config)` from the application, after the agent started.
@@ -571,6 +821,7 @@ export default function start(
   agentVmNs: number,
 ) {
   let agent: Agent | undefined;
+  onApiCommand((command: string, threadId: number, value: unknown) => agent?.apiCommand(command, threadId, value));
   const updates: object[] = onStart((json: string) => {
     const update = JSON.parse(json);
     if (agent) agent.update(update);
@@ -589,8 +840,8 @@ export default function start(
     return;
   }
   agent = new Agent(endpoint, agentId, mainPath, { mainEntryNs, agentThreadNs, agentVmNs }, updates);
-  onExit((code: number, signal?: string, message?: string, stack?: string) =>
-    agent.reportExit(code, signal, message, stack),
+  onExit((code: number, signal?: string, message?: string, stack?: string, mainProfile?) =>
+    agent.reportExit(code, signal, message, stack, mainProfile),
   );
   agent.connect();
 }

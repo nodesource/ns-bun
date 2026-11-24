@@ -35,9 +35,16 @@ unsafe extern "C" {
         agent_thread_ns: f64,
         agent_vm_ns: f64,
     );
-    safe fn Bun__NSolid__registerThread(context_id: u32);
+    safe fn Bun__NSolid__registerThread(global: &JSGlobalObject, context_id: u32);
     safe fn Bun__NSolid__unregisterThread(context_id: u32);
+    safe fn Bun__NSolid__noteRequestedCollection(full: bool);
     safe fn Bun__NSolid__recordFatalError(global: &JSGlobalObject, error: JSValue);
+    fn Bun__NSolid__recordCrash(
+        reason: *const u8,
+        reason_len: usize,
+        trace: *const u8,
+        trace_len: usize,
+    );
     fn Bun__NSolid__reportExit(code: i32, signal: *const c_char);
 }
 
@@ -64,8 +71,12 @@ pub fn record_fatal_error(global: &JSGlobalObject, error: JSValue) {
 /// waits on that thread and on the agent's, so a signal the kernel gives
 /// either of them goes on to the main thread. Masks can't keep it off the
 /// agent's: its event loop waits with every signal unblocked.
+///
+/// A crash (a fault, an abort, a panic) is reported the same way: the crash
+/// handler leaves its record in `CRASH` and sends `CRASHED` down the pipe.
 #[cfg(unix)]
 mod signals {
+    use bun_collections::BoundedArray;
     use bun_sys::Fd;
     use core::cell::Cell;
     use core::ffi::{CStr, c_int};
@@ -76,6 +87,25 @@ mod signals {
         (libc::SIGTERM, c"SIGTERM"),
         (libc::SIGHUP, c"SIGHUP"),
     ];
+    // The signals a crash ends the process with.
+    const CRASH_SIGNALS: [(c_int, &CStr); 6] = [
+        (libc::SIGSEGV, c"SIGSEGV"),
+        (libc::SIGBUS, c"SIGBUS"),
+        (libc::SIGILL, c"SIGILL"),
+        (libc::SIGFPE, c"SIGFPE"),
+        (libc::SIGTRAP, c"SIGTRAP"),
+        (libc::SIGABRT, c"SIGABRT"),
+    ];
+    // What the pipe carries for a crash: no signal is 0.
+    const CRASHED: u8 = 0;
+
+    const CRASH_TEXT_BYTES: usize = 1024;
+    struct Crash {
+        signal: c_int,
+        reason: BoundedArray<u8, CRASH_TEXT_BYTES>,
+        trace: BoundedArray<u8, CRASH_TEXT_BYTES>,
+    }
+    static CRASH: bun_core::util::Once<Crash> = bun_core::util::Once::new();
     // A little longer than the report itself may take.
     const ACK_TIMEOUT_MS: c_int = 6_000;
 
@@ -138,6 +168,43 @@ mod signals {
         }
     }
 
+    /// Hands the reporter the crash and waits until it is reported, as the
+    /// signal handler does. The crash handler calls it from the one thread
+    /// left reporting; a crash of the agent's thread or the reporter's can't
+    /// be reported.
+    pub(super) fn report_crash(signal: c_int, reason: &[u8], trace: &[u8]) {
+        if WAITED_ON.get() {
+            return;
+        }
+        let mut crash = Crash {
+            signal,
+            reason: BoundedArray::default(),
+            trace: BoundedArray::default(),
+        };
+        crash
+            .reason
+            .append_slice_assume_capacity(&reason[..reason.len().min(CRASH_TEXT_BYTES)]);
+        crash
+            .trace
+            .append_slice_assume_capacity(&trace[..trace.len().min(CRASH_TEXT_BYTES)]);
+        CRASH.get_or_init(|| crash);
+        hand_to_reporter(CRASHED);
+    }
+
+    fn hand_to_reporter(byte: u8) {
+        let to_reporter = Fd::from_native(TO_REPORTER.load(Ordering::Relaxed));
+        // write(2) and poll(2) are async-signal-safe.
+        if matches!(bun_sys::write(to_reporter, &[byte]), Ok(1)) {
+            let mut ack = libc::pollfd {
+                fd: FROM_REPORTER.load(Ordering::Relaxed),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one pollfd.
+            unsafe { libc::poll(&raw mut ack, 1, ACK_TIMEOUT_MS) };
+        }
+    }
+
     extern "C" fn on_signal(signal: c_int) {
         if WAITED_ON.get() {
             // SAFETY: pthread_kill(3) is async-signal-safe, and the main thread
@@ -150,17 +217,8 @@ mod signals {
             };
             return;
         }
-        let to_reporter = Fd::from_native(TO_REPORTER.load(Ordering::Relaxed));
-        // write(2), poll(2), signal(2) and raise(3) are async-signal-safe.
-        if matches!(bun_sys::write(to_reporter, &[signal as u8]), Ok(1)) {
-            let mut ack = libc::pollfd {
-                fd: FROM_REPORTER.load(Ordering::Relaxed),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: one pollfd.
-            unsafe { libc::poll(&raw mut ack, 1, ACK_TIMEOUT_MS) };
-        }
+        hand_to_reporter(signal as u8);
+        // signal(2) and raise(3) are async-signal-safe.
         // SAFETY: no pointers.
         unsafe {
             libc::signal(signal, libc::SIG_DFL);
@@ -174,9 +232,24 @@ mod signals {
             (Fd::from_native(from_handler), Fd::from_native(to_handler));
         let mut byte = [0u8];
         while matches!(bun_sys::read(from_handler, &mut byte), Ok(1)) {
-            let signal = c_int::from(byte[0]);
+            let mut signal = c_int::from(byte[0]);
+            if byte[0] == CRASHED {
+                let Some(crash) = CRASH.get() else { continue };
+                signal = crash.signal;
+                let (reason, trace) = (crash.reason.const_slice(), crash.trace.const_slice());
+                // SAFETY: both slices are valid for their lengths.
+                unsafe {
+                    super::Bun__NSolid__recordCrash(
+                        reason.as_ptr(),
+                        reason.len(),
+                        trace.as_ptr(),
+                        trace.len(),
+                    )
+                };
+            }
             let name = SIGNALS
                 .iter()
+                .chain(CRASH_SIGNALS.iter())
                 .find(|(s, _)| *s == signal)
                 .map(|(_, name)| *name);
             super::report_exit(signal, name);
@@ -187,9 +260,17 @@ mod signals {
 
 /// Lists a JavaScript thread for the agent's per-thread metrics, from that
 /// thread, once its VM runs. Nothing is kept unless the agent was started.
-pub fn register_thread(context_id: u32) {
+pub fn register_thread(global: &JSGlobalObject, context_id: u32) {
     if STARTED.load(Ordering::Relaxed) {
-        Bun__NSolid__registerThread(context_id);
+        Bun__NSolid__registerThread(global, context_id);
+    }
+}
+
+/// A collection that JS asked for on this thread (`Bun.gc`, `gc()`), which the
+/// agent counts as N|Solid counts V8's forced ones.
+pub fn note_requested_collection(sync: bool) {
+    if STARTED.load(Ordering::Relaxed) {
+        Bun__NSolid__noteRequestedCollection(sync);
     }
 }
 
@@ -249,9 +330,12 @@ fn start(vm: &VirtualMachine) {
     if STARTED.swap(true, Ordering::Relaxed) {
         return;
     }
-    register_thread(MAIN_CONTEXT_ID);
+    register_thread(vm.global(), MAIN_CONTEXT_ID);
     #[cfg(unix)]
-    signals::install();
+    {
+        signals::install();
+        bun_core::Global::set_crash_report(signals::report_crash);
+    }
     let main_entry = since_process_start_ns();
     let main_path = vm.main().unwrap_or_default().to_vec();
     // The agent VM builds its `process.env` from this copy, which is where it
