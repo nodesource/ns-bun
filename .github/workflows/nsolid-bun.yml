@@ -64,7 +64,13 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: N|Solid tests
-        run: ./build/release/bun-profile test test/js/bun/nsolid/
+        # The runner hands a crashing process to systemd-coredump, which holds
+        # it for seconds while it reads a large binary's memory; the crash
+        # tests' processes end at once, as on Bun's own CI machines.
+        run: |
+          echo core | sudo tee /proc/sys/kernel/core_pattern
+          ulimit -c 0
+          ./build/release/bun-profile test test/js/bun/nsolid/
 
       - name: Package
         run: |
