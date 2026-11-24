@@ -83,14 +83,16 @@ constexpr unsigned maxNameLength = 1024;
 // strings, when it is kept, comes on top.
 constexpr uint64_t costPerCell = 320;
 
-// An edge as the collector reports it. `from` is null for a root.
+// An edge as the collector reports it. `from` is null for a root. The name is
+// held: the collector's is only sure to live through its call, and the
+// snapshot is written after the collection, while the heap is swept.
 struct CellEdge {
     JSCell* from;
     JSCell* to;
     EdgeType type;
     RootMarkReason reason;
     uint32_t index;
-    UniquedStringImpl* name;
+    RefPtr<UniquedStringImpl> name;
 };
 
 // An edge between nodes, by their indices. `nameOrIndex` is a string's index
@@ -350,7 +352,7 @@ public:
             }
             uint32_t nameOrIndex = edge.index;
             if (edge.name)
-                nameOrIndex = strings.add(edgeName(edge.name, redact));
+                nameOrIndex = strings.add(edgeName(*edge.name, redact));
             edges.append({ from, firstCell + to->value, edge.type, nameOrIndex });
         }
         m_edges.clear();
@@ -433,13 +435,13 @@ public:
     }
 
 private:
-    static String edgeName(UniquedStringImpl* name, bool redact)
+    static String edgeName(UniquedStringImpl& name, bool redact)
     {
-        if (!name->isSymbol())
-            return truncatedName(String(name));
+        if (!name.isSymbol())
+            return truncatedName(String(&name));
         if (redact)
             return "<symbol>"_s;
-        return makeString("<symbol "_s, truncatedName(String(name)), ">"_s);
+        return makeString("<symbol "_s, truncatedName(String(&name)), ">"_s);
     }
 
     Lock m_lock;
