@@ -1,8 +1,8 @@
 import * as grpc from "@grpc/grpc-js";
 import * as protoLoader from "@grpc/proto-loader";
 import { describe, expect, test } from "bun:test";
-import { bunEnv, bunExe, tempDir, tls } from "harness";
-import { existsSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { bunEnv, bunExe, isLinux, tempDir, tls } from "harness";
+import { existsSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -686,6 +686,37 @@ describe("N|Solid agent", () => {
         code: 15,
         signal: "SIGTERM",
         signalCode: "SIGTERM",
+      });
+    });
+
+    // The signal handler waits on the agent's thread and on the thread that
+    // reports the signal. Handled on either, it held the exit for 5 seconds.
+    test.concurrent.skipIf(!isLinux)("without handling a signal on the agent's own threads", async () => {
+      await using gateway = await grpcGateway([{ requestId: "r-info", id: "x", command: "info" }]);
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "-e", UNTIL_STDIN_CLOSES],
+        stdin: "pipe",
+        stdout: "ignore",
+        stderr: "ignore",
+        env: { ...bunEnv, NSOLID_GRPC: `127.0.0.1:${gateway.port}`, NSOLID_GRPC_INSECURE: "1" },
+      });
+      await gateway.next("ExportInfo");
+
+      const reported = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
+      const blocked: Record<string, string[]> = {};
+      for (const tid of readdirSync(`/proc/${proc.pid}/task`)) {
+        const status = readFileSync(`/proc/${proc.pid}/task/${tid}/status`, "utf8");
+        const name = Number(tid) === proc.pid ? "main" : status.match(/^Name:\t(.*)$/m)![1];
+        if (name !== "main" && name !== "NSolidAgent" && name !== "NSolidSignal") continue;
+        const mask = BigInt("0x" + status.match(/^SigBlk:\t([0-9a-f]+)$/m)![1]);
+        blocked[name] = Object.entries(reported)
+          .filter(([, signal]) => (mask >> BigInt(signal - 1)) & 1n)
+          .map(([signalName]) => signalName);
+      }
+      expect(blocked).toEqual({
+        main: [],
+        NSolidAgent: ["SIGHUP", "SIGINT", "SIGTERM"],
+        NSolidSignal: ["SIGHUP", "SIGINT", "SIGTERM"],
       });
     });
   });

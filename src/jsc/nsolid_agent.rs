@@ -60,7 +60,8 @@ pub fn record_fatal_error(global: &JSGlobalObject, error: JSValue) {
 /// N|Solid reports an exit by SIGINT, SIGTERM or SIGHUP when nothing else
 /// handles the signal, then lets the signal end the process. The handler only
 /// writes the signal to a pipe and waits on another, which are
-/// async-signal-safe; a thread of its own does the reporting.
+/// async-signal-safe; a thread of its own does the reporting. The handler
+/// waits on that thread and on the agent's, so both block the signals.
 #[cfg(unix)]
 mod signals {
     use bun_sys::Fd;
@@ -98,9 +99,11 @@ mod signals {
         };
         TO_REPORTER.store(to_reporter[1], Ordering::Relaxed);
         FROM_REPORTER.store(from_reporter[0], Ordering::Relaxed);
-        let spawned = std::thread::Builder::new()
-            .name("NSolidSignal".to_string())
-            .spawn(move || report_signals(to_reporter[0], from_reporter[1]));
+        let spawned = blocked_while(|| {
+            std::thread::Builder::new()
+                .name("NSolidSignal".to_string())
+                .spawn(move || report_signals(to_reporter[0], from_reporter[1]))
+        });
         if spawned.is_err() {
             return;
         }
@@ -120,6 +123,31 @@ mod signals {
                 libc::sigaction(signal, &raw const action, core::ptr::null_mut());
             }
         }
+    }
+
+    /// Runs `spawn` with the signals blocked on this thread, so that the thread
+    /// it starts begins with them blocked, as do the threads that one starts.
+    pub(super) fn blocked_while<T>(spawn: impl FnOnce() -> T) -> T {
+        let mut set: libc::sigset_t = bun_core::ffi::zeroed();
+        let mut previous: libc::sigset_t = bun_core::ffi::zeroed();
+        // SAFETY: both sets are valid memory; sigemptyset initializes `set`.
+        unsafe {
+            libc::sigemptyset(&raw mut set);
+            for (signal, _) in SIGNALS {
+                libc::sigaddset(&raw mut set, signal);
+            }
+            libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, &raw mut previous);
+        }
+        let spawned = spawn();
+        // SAFETY: `previous` is the mask pthread_sigmask returned above.
+        unsafe {
+            libc::pthread_sigmask(
+                libc::SIG_SETMASK,
+                &raw const previous,
+                core::ptr::null_mut(),
+            )
+        };
+        spawned
     }
 
     extern "C" fn on_signal(signal: c_int) {
@@ -234,10 +262,16 @@ fn start(vm: &VirtualMachine) {
     };
     // A full `VirtualMachine::init` plus module load needs more than the
     // 2 MiB default stack, as for the Debugger thread.
-    let spawned = std::thread::Builder::new()
-        .name("NSolidAgent".to_string())
-        .stack_size(16 * 1024 * 1024)
-        .spawn(move || agent_thread(env_map, main_path, main_entry));
+    let spawn = move || {
+        std::thread::Builder::new()
+            .name("NSolidAgent".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || agent_thread(env_map, main_path, main_entry))
+    };
+    #[cfg(unix)]
+    let spawned = signals::blocked_while(spawn);
+    #[cfg(not(unix))]
+    let spawned = spawn();
     if spawned.is_err() {
         bun_core::scoped_log!(nsolid_agent, "could not spawn the agent thread");
     }
