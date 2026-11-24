@@ -254,7 +254,8 @@ function applyReconfigure(config: Config, body: Record<string, any> | undefined)
     const value = reconfigurable[key](body[key]);
     if (value !== undefined) (config as any)[key] = value;
   }
-  if (Array.isArray(body.tags) && body.tags.length) config.tags = parseTags(body.tags);
+  const { tags } = body;
+  if (Array.isArray(tags) && tags.length) config.tags = parseTags(tags);
 }
 
 // `nsolid.start(config)`: N|Solid's `updateConfig`. Each key given replaces

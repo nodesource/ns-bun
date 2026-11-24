@@ -386,10 +386,11 @@ class FrameReader {
   pending = new Uint8Array(0);
 
   push(chunk: Uint8Array): Uint8Array[] {
-    if (this.pending.length) {
-      const joined = new Uint8Array(this.pending.length + chunk.length);
+    const { length } = this.pending;
+    if (length) {
+      const joined = new Uint8Array(length + chunk.length);
       joined.set(this.pending);
-      joined.set(chunk, this.pending.length);
+      joined.set(chunk, length);
       chunk = joined;
     }
     const messages: Uint8Array[] = [];

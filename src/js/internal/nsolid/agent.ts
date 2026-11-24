@@ -311,7 +311,8 @@ class Agent {
       "nsolid-agent-id": agentId,
       "nsolid-version": `nsolid-bun-v${process.versions.nsolid_bun}+bun-v${Bun.version}`,
     };
-    if (endpoint.saasToken) this.metadata["nsolid-saas"] = endpoint.saasToken;
+    const { saasToken } = endpoint;
+    if (saasToken) this.metadata["nsolid-saas"] = saasToken;
     this.scheduleMetrics();
   }
 

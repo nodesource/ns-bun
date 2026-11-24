@@ -9,8 +9,8 @@
 // services. Options are ignored.
 
 import { readFileSync, writeFileSync } from "node:fs";
-import * as prettier from "prettier";
 import { dirname, join, relative } from "node:path";
+import * as prettier from "prettier";
 
 const here = import.meta.dirname;
 const protoDir = join(here, "proto");
