@@ -191,18 +191,31 @@ async function measure(bin: string) {
   };
 
   const results: Record<string, any> = {};
-  for (const setup of setups) results[setup.name] = { startupMs: 0, rssMb: 0, threads: 0, idleCpuPercent: 0, http: {} };
+  for (const setup of setups)
+    results[setup.name] = { startupMs: 0, exitMs: 0, rssMb: 0, threads: 0, idleCpuPercent: 0, http: {} };
 
-  // Startup: the median wall time of `-e 0`, over 30 runs after 3 warm-ups.
+  // Startup: until the script's first output, and until the process is gone (the agent reports the exit first). The
+  // medians of 30 runs after 3 warm-ups.
   for (const setup of setups) {
-    const times: number[] = [];
+    const ready: number[] = [];
+    const ended: number[] = [];
     for (let i = 0; i < 33; i++) {
       const t0 = performance.now();
-      await Bun.spawn({ cmd: pinned("0", [bin, "-e", "0"]), env: setup.env, stdout: "ignore", stderr: "ignore" })
-        .exited;
-      if (i >= 3) times.push(performance.now() - t0);
+      const proc = Bun.spawn({
+        cmd: pinned("0", [bin, "-e", "process.stdout.write('.')"]),
+        env: setup.env,
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      await proc.stdout.getReader().read();
+      const t1 = performance.now();
+      await proc.exited;
+      if (i < 3) continue;
+      ready.push(t1 - t0);
+      ended.push(performance.now() - t1);
     }
-    results[setup.name].startupMs = median(times);
+    results[setup.name].startupMs = median(ready);
+    results[setup.name].exitMs = median(ended);
   }
 
   // Memory: the median RSS of 5 idle Bun.serve processes, 5 s after their
@@ -281,14 +294,15 @@ function report(measured: Awaited<ReturnType<typeof measure>>) {
   const verdict = (ok: boolean) => (ok ? "within" : "**over**");
 
   lines.push(`Binary: \`${measured.binary}\`, ${measured.cpus} CPUs${measured.pinned ? ", pinned" : ""}.`, "");
-  row("Setup", "Startup", "RSS idle", "Threads", "Idle CPU (% of a core)");
-  row("---", "---:", "---:", "---:", "---:");
+  row("Setup", "Startup", "Exit", "RSS idle", "Threads", "Idle CPU (% of a core)");
+  row("---", "---:", "---:", "---:", "---:", "---:");
   for (const [name, r] of Object.entries(results) as [string, any][]) {
     const dStart = r.startupMs - none.startupMs;
     const dRss = r.rssMb - none.rssMb;
     row(
       name,
       `${round(r.startupMs, 2)} ms${name === "no agent" ? "" : ` (+${round(dStart, 2)}, ${verdict(dStart <= BUDGET.startupMs)})`}`,
+      `${round(r.exitMs, 2)} ms`,
       `${round(r.rssMb)} MB${name === "no agent" ? "" : ` (+${round(dRss)}, ${verdict(dRss <= BUDGET.rssMb)})`}`,
       r.threads,
       `${round(r.idleCpuPercent, 2)}${name === "no agent" ? "" : ` (${verdict(r.idleCpuPercent <= BUDGET.idleCpuPercent)})`}`,
