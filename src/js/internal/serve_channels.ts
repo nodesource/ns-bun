@@ -9,6 +9,7 @@ const { builtinChannel } = require("internal/shared");
 
 const onStart = builtinChannel("bun:serve:request:start");
 const onEnd = builtinChannel("bun:serve:request:end");
+const callInFrameOf = $newCppFunction("AsyncContextFrame.cpp", "jsFunctionCallInFrameOf", 2);
 
 // Keep in sync with ServeTrace.rs
 const enum Op {
@@ -47,12 +48,18 @@ function serveHook(
   }
   const context: ServeContext = { request: request!, server };
   started = context;
-  const handler = handlerOrOutcome as (this: unknown, request: Request, server: unknown) => unknown;
+  // A handler made in an AsyncLocalStorage context comes wrapped with it, as the server keeps it: that context is
+  // entered first, and the channel's stores over it.
+  if ($isCallable(handlerOrOutcome)) return callHandler(handlerOrOutcome, context, thisArg, request!, server);
+  return callInFrameOf(handlerOrOutcome, handler => callHandler(handler, context, thisArg, request!, server));
+}
+
+function callHandler(handler: Function, context: ServeContext, thisArg: unknown, request: Request, server: unknown) {
   const channel = onStart.channel;
-  if (channel === undefined) return handler.$call(thisArg, request!, server);
+  if (channel === undefined) return handler.$call(thisArg, request, server);
   const scope = channel.withStoreScope(context);
   try {
-    return handler.$call(thisArg, request!, server);
+    return handler.$call(thisArg, request, server);
   } finally {
     scope[Symbol.dispose]();
   }

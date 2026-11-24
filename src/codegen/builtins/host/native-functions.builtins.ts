@@ -151,6 +151,7 @@ const testOf = (name: string) => {
 
 // What the code of each answers.
 const answersOfNativeFunctions: readonly (readonly [b.BuiltinPath, b.TableType])[] = [
+  [cpp("AsyncContextFrame.cpp", "jsFunctionCallInFrameOf"), b.any],
   [cpp("BunDebugger.cpp", "jsFunction_closeNodeInspector"), b.undefined],
   // The error is handed back for open() to throw.
   [

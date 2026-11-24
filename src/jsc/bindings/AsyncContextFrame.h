@@ -54,6 +54,11 @@ public:
     }
 };
 
+// For built-in JS that calls a function the way AsyncContextFrame::call() would, with code of its own in between:
+// `(value, fn)` calls `fn(callback)`, in the async context `value` was wrapped with and with the function it wraps,
+// or `fn(value)` if `value` is no wrapper.
+JSC_DECLARE_HOST_FUNCTION(jsFunctionCallInFrameOf);
+
 // Makes `snapshot` the current async context for the scope's lifetime. No-op if `snapshot` is empty, undefined or null.
 class AsyncContextScope {
     WTF_MAKE_NONCOPYABLE(AsyncContextScope);

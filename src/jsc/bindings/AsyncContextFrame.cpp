@@ -188,3 +188,27 @@ JSValue AsyncContextFrame::profiledCall(JSGlobalObject* global, JSValue function
     return AsyncContextFrame::call(global, functionObject, thisValue, args);
 }
 #undef ASYNCCONTEXTFRAME_CALL_IMPL
+
+JSC_DEFINE_HOST_FUNCTION(jsFunctionCallInFrameOf, (JSGlobalObject * globalObject, CallFrame* callFrame))
+{
+    auto& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    JSValue value = callFrame->argument(0);
+    JSValue fn = callFrame->argument(1);
+    MarkedArgumentBuffer args;
+    auto* wrapper = dynamicDowncast<AsyncContextFrame>(value);
+    if (!wrapper) {
+        args.append(value);
+        RELEASE_AND_RETURN(scope, JSValue::encode(JSC::call(globalObject, fn, JSC::getCallData(fn), jsUndefined(), args)));
+    }
+    if (Bun::shouldDropCallbackOfStoppedModuleGraph(defaultGlobalObject(globalObject), wrapper->context.get())) [[unlikely]]
+        return JSValue::encode(jsUndefined());
+    args.append(wrapper->callback.get());
+    JSValue result;
+    {
+        AsyncContextScope context(globalObject, wrapper->context.get());
+        result = JSC::call(globalObject, fn, JSC::getCallData(fn), jsUndefined(), args);
+    }
+    RETURN_IF_EXCEPTION(scope, {});
+    return JSValue::encode(result);
+}
