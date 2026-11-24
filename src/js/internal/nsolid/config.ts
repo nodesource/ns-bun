@@ -71,7 +71,8 @@ function readPackageJson(env: Env, main: string): Record<string, any> {
       return undefined;
     }
   };
-  if (env.NSOLID_PACKAGE_JSON) return read(env.NSOLID_PACKAGE_JSON) ?? {};
+  const { NSOLID_PACKAGE_JSON } = env;
+  if (NSOLID_PACKAGE_JSON) return read(NSOLID_PACKAGE_JSON) ?? {};
   let dir = main ? path.dirname(main) : process.cwd();
   for (;;) {
     const file = path.join(dir, "package.json");
@@ -140,7 +141,8 @@ function applyReconfigure(config: Config, body: Record<string, any> | undefined)
   for (const key of reconfigurable) {
     if (body[key] !== undefined && body[key] !== null) (config as any)[key] = body[key];
   }
-  if (Array.isArray(body.tags) && body.tags.length) config.tags = parseTags(body.tags);
+  const { tags } = body;
+  if (Array.isArray(tags) && tags.length) config.tags = parseTags(tags);
 }
 
 // The whole configuration as a `ReconfigureBody`. The Console compares every

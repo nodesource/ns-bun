@@ -115,7 +115,8 @@ class Agent {
       "nsolid-agent-id": agentId,
       "nsolid-version": `bun-v${Bun.version}`,
     };
-    if (endpoint.saasToken) this.metadata["nsolid-saas"] = endpoint.saasToken;
+    const { saasToken } = endpoint;
+    if (saasToken) this.metadata["nsolid-saas"] = saasToken;
   }
 
   connect() {
