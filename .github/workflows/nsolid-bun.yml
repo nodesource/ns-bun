@@ -140,10 +140,14 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Run
+        env:
+          # With the agent tracing, every request carries a traceparent, and these tests of Node's assert exactly
+          # which headers a request has.
+          LEFT_OUT: ${{ matrix.agent == 'on' && 'parallel/test-http-max-headers-count.js,parallel/test-http-mutable-headers.js,parallel/test-http-proxy-request-socket-keep-alive.mjs,parallel/test-http-proxy-request-invalid-char-in-url.mjs' || '' }}
         run: |
           echo core | sudo tee /proc/sys/kernel/core_pattern
           ulimit -c 0
-          node scripts/runner.node.ts --exec-path build/release/bun --vendor=false --include "${{ matrix.suite.include }}"
+          node scripts/runner.node.ts --exec-path build/release/bun --vendor=false --include "${{ matrix.suite.include }}" ${LEFT_OUT:+--exclude "$LEFT_OUT"}
 
   # What the agent costs the build above, against the overhead budget, in the
   # run's summary. Shared runners are noisy, so this reports and never fails
